@@ -4,7 +4,7 @@ import logging
 import pandas as pd
 import streamlit as st
 
-from components import tab_investments, tab_kline, tab_monitor, tab_optimize, tab_signals
+from components import tab_dashboard, tab_strategy_tools
 from components.sidebar import render_sidebar
 from components.styles import CUSTOM_CSS
 from src.data_loader import fetch_etf_data
@@ -108,18 +108,12 @@ ctx = {
     "scale_threshold": cfg["scale_threshold"],
 }
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["盯盘总览", "K线图表", "信号流水", "投资记录", "参数优化"])
+tab1, tab2 = st.tabs(["Dashboard", "策略工具"])
 
 with tab1:
-    tab_monitor.render(ctx)
+    tab_dashboard.render(ctx)
 with tab2:
-    tab_kline.render(ctx)
-with tab3:
-    tab_signals.render(ctx)
-with tab4:
-    tab_investments.render(ctx)
-with tab5:
-    tab_optimize.render(ctx)
+    tab_strategy_tools.render(ctx)
 
 st.markdown("---")
 st.markdown(

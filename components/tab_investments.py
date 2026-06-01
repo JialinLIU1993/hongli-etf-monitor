@@ -153,13 +153,8 @@ def _default_trade_price(ctx, symbol, trade_date):
     return 1.0, lookup
 
 
-def render(ctx):
-    """Render investment records and calculated return history."""
-    st.markdown("### 投资记录")
-    st.caption(f"记录保存在本机 `{RECORDS_PATH}`，该文件已被忽略，不会上传到公开仓库。")
-
-    records = load_records()
-
+def _render_record_form(ctx, records):
+    """Render the add-record form and persist submitted data."""
     with st.container(border=True):
         st.markdown("#### 新增买入/卖出")
         c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.1, 1.2])
@@ -194,7 +189,7 @@ def render(ctx):
         else:
             c5.caption(price_lookup["message"])
 
-        submitted = st.button("保存记录", type="primary")
+        submitted = st.button("保存记录", type="primary", key="investment_save_record")
         if submitted:
             try:
                 records = append_record(
@@ -212,7 +207,86 @@ def render(ctx):
                 st.rerun()
             except ValueError as exc:
                 st.error(str(exc))
+    return records
 
+
+def _render_raw_records(records, analysis):
+    """Render raw record management."""
+    with st.expander("原始流水与删除", expanded=False):
+        record_display = _format_records(analysis["records"])
+        if record_display.empty:
+            st.info("暂无投资记录。")
+        else:
+            st.dataframe(record_display.sort_values("日期", ascending=False), width="stretch", hide_index=True)
+            labels = {
+                row["记录ID"]: f"{row['日期']} {row['ETF']} {row['方向']} {row['份额']}份 @ {row['成交价']}"
+                for _, row in record_display.iterrows()
+            }
+            selected_ids = st.multiselect(
+                "选择要删除的记录",
+                options=list(labels.keys()),
+                format_func=lambda value: labels[value],
+                key="investment_delete_ids",
+            )
+            if st.button("删除选中记录", type="secondary", disabled=not selected_ids, key="investment_delete_records"):
+                save_records(delete_records(records, selected_ids))
+                st.success("已删除选中记录。")
+                st.rerun()
+
+            csv = record_display.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "导出投资流水",
+                csv,
+                file_name="investment_records.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+
+
+def render(ctx, show_title=True, compact=False):
+    """Render investment records and calculated return history."""
+    if show_title:
+        st.markdown("### 投资记录")
+    st.caption(f"记录保存在本机 `{RECORDS_PATH}`，该文件已被忽略，不会上传到公开仓库。")
+
+    records = load_records()
+    analysis = calculate_investment_summary(records, _current_prices_from_ctx(ctx))
+
+    if compact:
+        _render_summary(analysis["summary"])
+
+        if not analysis["unmatched_sells"].empty:
+            st.warning("存在卖出份额超过已记录持仓的记录，相关部分未计入收益。请检查交易流水。")
+
+        st.markdown("#### 当前持仓")
+        open_display = _format_open_positions(analysis["open_positions"])
+        if open_display.empty:
+            st.info("暂无未卖出的持仓。")
+        else:
+            st.dataframe(open_display, width="stretch", hide_index=True)
+
+        with st.expander("新增买入/卖出", expanded=False):
+            _render_record_form(ctx, records)
+
+        with st.expander("历史收益", expanded=False):
+            _render_history_chart(analysis["history"])
+            history_display = _format_history(analysis["history"])
+            if history_display.empty:
+                st.info("暂无已实现收益，卖出记录会在这里形成历史收益。")
+            else:
+                st.dataframe(history_display.sort_values("月份", ascending=False), width="stretch", hide_index=True)
+
+        with st.expander("已实现交易明细", expanded=False):
+            closed_display = _format_closed_trades(analysis["closed_trades"])
+            if closed_display.empty:
+                st.info("暂无已配对的卖出交易。")
+            else:
+                st.dataframe(closed_display.sort_values("卖出日期", ascending=False), width="stretch", hide_index=True)
+
+        _render_raw_records(records, analysis)
+        return
+
+    records = _render_record_form(ctx, records)
     analysis = calculate_investment_summary(records, _current_prices_from_ctx(ctx))
 
     st.markdown("---")
@@ -246,31 +320,4 @@ def render(ctx):
         else:
             st.dataframe(closed_display.sort_values("卖出日期", ascending=False), width="stretch", hide_index=True)
 
-    with st.expander("原始流水与删除", expanded=False):
-        record_display = _format_records(analysis["records"])
-        if record_display.empty:
-            st.info("暂无投资记录。")
-        else:
-            st.dataframe(record_display.sort_values("日期", ascending=False), width="stretch", hide_index=True)
-            labels = {
-                row["记录ID"]: f"{row['日期']} {row['ETF']} {row['方向']} {row['份额']}份 @ {row['成交价']}"
-                for _, row in record_display.iterrows()
-            }
-            selected_ids = st.multiselect(
-                "选择要删除的记录",
-                options=list(labels.keys()),
-                format_func=lambda value: labels[value],
-            )
-            if st.button("删除选中记录", type="secondary", disabled=not selected_ids):
-                save_records(delete_records(records, selected_ids))
-                st.success("已删除选中记录。")
-                st.rerun()
-
-            csv = record_display.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "导出投资流水",
-                csv,
-                file_name="investment_records.csv",
-                mime="text/csv",
-                width="stretch",
-            )
+    _render_raw_records(records, analysis)

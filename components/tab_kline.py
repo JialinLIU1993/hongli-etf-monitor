@@ -27,12 +27,13 @@ def _format_date(value):
     return value.strftime("%Y-%m-%d") if hasattr(value, "strftime") else str(value)
 
 
-def render(ctx):
+def render(ctx, title="K线与布林带", compact=False):
     """Render K-line and Bollinger bands for the selected ETF."""
     frames = ctx['frames']
     profiles = ctx['profiles']
 
-    st.markdown("### K线与布林带")
+    if title:
+        st.markdown(f"### {title}")
 
     control_cols = st.columns([1.1, 2.4, 1.5])
     with control_cols[0]:
@@ -146,7 +147,7 @@ def render(ctx):
         template='plotly_white',
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
-        height=620,
+        height=460 if compact else 620,
         xaxis_rangeslider_visible=False,
         dragmode="pan",
         hovermode="x unified",

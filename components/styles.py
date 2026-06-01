@@ -107,6 +107,71 @@ CUSTOM_CSS = """
         padding: 1rem;
         color: #1e40af;
     }
+
+    /* Dashboard compact strips */
+    .dashboard-strip {
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+        align-items: flex-start;
+        padding: 1rem 0;
+        border-top: 1px solid #e5e7eb;
+        border-bottom: 1px solid #e5e7eb;
+        margin-bottom: 0.75rem;
+    }
+
+    .dashboard-kicker {
+        color: #6b7280;
+        font-size: 0.82rem;
+        font-weight: 600;
+    }
+
+    .dashboard-status {
+        color: #111827;
+        font-size: 1.25rem;
+        line-height: 1.2;
+        font-weight: 750;
+        margin-top: 0.2rem;
+    }
+
+    .dashboard-hint {
+        color: #4b5563;
+        font-size: 0.9rem;
+        line-height: 1.45;
+        margin-top: 0.4rem;
+    }
+
+    .dashboard-price {
+        text-align: right;
+        min-width: 5.5rem;
+    }
+
+    .dashboard-price span {
+        color: #d97706;
+        display: block;
+        font-size: 1.35rem;
+        font-weight: 800;
+        line-height: 1.15;
+    }
+
+    .dashboard-price small {
+        color: #6b7280;
+        display: block;
+        font-size: 0.8rem;
+        margin-top: 0.25rem;
+    }
+
+    .dashboard-strip-buy {
+        border-color: #fecaca;
+    }
+
+    .dashboard-strip-sell {
+        border-color: #bbf7d0;
+    }
+
+    .dashboard-strip-watch {
+        border-color: #bfdbfe;
+    }
     
     /* Tab 样式 */
     .stTabs [data-baseweb="tab-list"] {
