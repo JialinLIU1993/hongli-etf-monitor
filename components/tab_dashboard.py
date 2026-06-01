@@ -79,8 +79,8 @@ def _render_etf_strip(status):
     )
 
     cols = st.columns(3)
-    cols[0].metric("下轨买点", _price(status["lower_band"]), f"{status['dist_to_lower']:.2%}")
-    cols[1].metric("上轨卖点", _price(status["upper_band"]), f"{status['dist_to_upper']:.2%}")
+    cols[0].metric("下轨买点", _price(status["lower_band"]), f"{status['dist_to_lower']:.2%}", delta_color="off")
+    cols[1].metric("上轨卖点", _price(status["upper_band"]), f"{status['dist_to_upper']:.2%}", delta_color="off")
     cols[2].metric("通道位置", f"{status['channel_position']:.0%}")
 
 
@@ -96,7 +96,7 @@ def render(ctx):
 
     top = st.columns([1.15, 1, 1, 1, 1])
     top[0].metric("数据截至", _date(common_latest))
-    top[1].metric("累计收益", _money(summary["total_pnl"]), _pct(summary["total_return"]))
+    top[1].metric("累计收益", _money(summary["total_pnl"]), _pct(summary["total_return"]), delta_color="inverse")
     top[2].metric("浮动收益", _money(summary["unrealized_pnl"]))
     top[3].metric("当前市值", _money(summary["market_value"]))
     top[4].metric("记录笔数", f"{summary['record_count']}")

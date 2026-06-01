@@ -104,8 +104,8 @@ def _format_history(history_df):
 
 def _render_summary(summary):
     cols = st.columns(5)
-    cols[0].metric("累计收益", _money(summary["total_pnl"]), _pct(summary["total_return"]))
-    cols[1].metric("已实现收益", _money(summary["realized_pnl"]), _pct(summary["realized_return"]))
+    cols[0].metric("累计收益", _money(summary["total_pnl"]), _pct(summary["total_return"]), delta_color="inverse")
+    cols[1].metric("已实现收益", _money(summary["realized_pnl"]), _pct(summary["realized_return"]), delta_color="inverse")
     cols[2].metric("浮动收益", _money(summary["unrealized_pnl"]))
     cols[3].metric("当前市值", _money(summary["market_value"]))
     cols[4].metric("投入成本口径", _money(summary["capital_base"]))

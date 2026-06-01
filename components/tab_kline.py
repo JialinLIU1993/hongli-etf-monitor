@@ -126,17 +126,17 @@ def render(ctx, title="K线与布林带", compact=False):
         x=buys.index, y=buys['low'] * 0.99,
         mode='markers',
         name='买入',
-        marker=dict(symbol='triangle-up', size=12, color='#22c55e')
+        marker=dict(symbol='triangle-up', size=12, color='#ef4444')
     ), row=1, col=1)
     fig_kline.add_trace(go.Scatter(
         x=sells.index, y=sells['high'] * 1.01,
         mode='markers',
         name='卖出',
-        marker=dict(symbol='triangle-down', size=12, color='#ef4444')
+        marker=dict(symbol='triangle-down', size=12, color='#22c55e')
     ), row=1, col=1)
 
     if show_volume:
-        colors = ['#22c55e' if df_view['close'].iloc[i] >= df_view['open'].iloc[i] else '#ef4444'
+        colors = ['#ef4444' if df_view['close'].iloc[i] >= df_view['open'].iloc[i] else '#22c55e'
                   for i in range(len(df_view))]
         fig_kline.add_trace(go.Bar(
             x=df_view.index, y=df_view['volume'],

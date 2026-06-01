@@ -50,9 +50,9 @@ def _render_status_card(status):
 
     top = st.columns(4)
     top[0].metric("最新价", _fmt_price(status["close"]))
-    top[1].metric("目标仓位", f"{status['target_position']:.0%}", status["signal_change"])
-    top[2].metric("下轨买点", _fmt_price(status["lower_band"]), f"{status['dist_to_lower']:.2%}")
-    top[3].metric("上轨卖点", _fmt_price(status["upper_band"]), f"{status['dist_to_upper']:.2%}")
+    top[1].metric("目标仓位", f"{status['target_position']:.0%}", status["signal_change"], delta_color="inverse")
+    top[2].metric("下轨买点", _fmt_price(status["lower_band"]), f"{status['dist_to_lower']:.2%}", delta_color="off")
+    top[3].metric("上轨卖点", _fmt_price(status["upper_band"]), f"{status['dist_to_upper']:.2%}", delta_color="off")
 
     bottom = st.columns(4)
     bottom[0].metric("中轨", _fmt_price(status["ma"]))
