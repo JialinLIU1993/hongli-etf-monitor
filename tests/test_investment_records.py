@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.investment_records import append_record, calculate_investment_summary, empty_records
+from src.investment_records import append_record, calculate_investment_summary, empty_records, lookup_trade_price
 
 
 def test_fifo_realized_pnl_with_fees():
@@ -85,3 +85,25 @@ def test_history_groups_realized_pnl_by_month():
     assert history.iloc[0]["month"] == "2026-03"
     assert history.iloc[0]["realized_pnl"] == pytest.approx(250)
     assert history.iloc[0]["trades"] == 2
+
+
+def test_lookup_trade_price_uses_selected_trade_date():
+    dates = pd.to_datetime(["2026-05-22", "2026-05-25", "2026-06-01"])
+    frame = pd.DataFrame({"close": [1.15, 1.159, 1.183]}, index=dates)
+
+    result = lookup_trade_price(frame, "2026-05-25")
+
+    assert result["price"] == pytest.approx(1.159)
+    assert result["date"] == pd.Timestamp("2026-05-25")
+    assert result["is_exact"] is True
+
+
+def test_lookup_trade_price_falls_back_to_previous_trading_day():
+    dates = pd.to_datetime(["2026-05-22", "2026-05-25"])
+    frame = pd.DataFrame({"close": [1.15, 1.159]}, index=dates)
+
+    result = lookup_trade_price(frame, "2026-05-24")
+
+    assert result["price"] == pytest.approx(1.15)
+    assert result["date"] == pd.Timestamp("2026-05-22")
+    assert result["is_exact"] is False

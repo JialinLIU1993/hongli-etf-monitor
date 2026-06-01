@@ -8,6 +8,7 @@ from src.investment_records import (
     append_record,
     calculate_investment_summary,
     delete_records,
+    lookup_trade_price,
     load_records,
     save_records,
 )
@@ -140,6 +141,18 @@ def _current_prices_from_ctx(ctx):
     return prices
 
 
+def _default_trade_price(ctx, symbol, trade_date):
+    lookup = lookup_trade_price(ctx["raw_data"].get(symbol), trade_date, field="close")
+    if lookup["price"] is not None:
+        return round(lookup["price"], 3), lookup
+
+    status_price = ctx["statuses"].get(symbol, {}).get("close")
+    if status_price:
+        lookup["message"] = "未找到所选日期行情，临时使用最新价，请手动确认成交价"
+        return round(float(status_price), 3), lookup
+    return 1.0, lookup
+
+
 def render(ctx):
     """Render investment records and calculated return history."""
     st.markdown("### 投资记录")
@@ -147,21 +160,41 @@ def render(ctx):
 
     records = load_records()
 
-    with st.form("investment_record_form", clear_on_submit=True):
+    with st.container(border=True):
         st.markdown("#### 新增买入/卖出")
         c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.1, 1.2])
-        trade_date = c1.date_input("日期", value=pd.Timestamp.today())
-        symbol = c2.selectbox("ETF", ["510880", "512890"], format_func=lambda s: f"{s} {ctx['profiles'][s].name}")
-        side_label = c3.segmented_control("方向", ["买入", "卖出"], default="买入")
-        quantity = c4.number_input("份额", min_value=1, value=1000, step=100)
+        trade_date = c1.date_input("日期", value=pd.Timestamp.today(), key="investment_trade_date")
+        symbol = c2.selectbox(
+            "ETF",
+            ["510880", "512890"],
+            format_func=lambda s: f"{s} {ctx['profiles'][s].name}",
+            key="investment_symbol",
+        )
+        side_label = c3.segmented_control("方向", ["买入", "卖出"], default="买入", key="investment_side")
+        quantity = c4.number_input("份额", min_value=1, value=1000, step=100, key="investment_quantity")
 
         c5, c6, c7 = st.columns([1.1, 1.1, 2.2])
-        default_price = float(ctx["statuses"].get(symbol, {}).get("close") or 1.0)
-        price = c5.number_input("成交价", min_value=0.001, value=round(default_price, 3), step=0.001, format="%.3f")
-        fee = c6.number_input("佣金/费用", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-        note = c7.text_input("备注", placeholder="可选")
+        default_price, price_lookup = _default_trade_price(ctx, symbol, trade_date)
+        price_key = f"investment_price_{symbol}_{pd.Timestamp(trade_date).strftime('%Y%m%d')}"
+        price = c5.number_input(
+            "成交价",
+            min_value=0.001,
+            value=default_price,
+            step=0.001,
+            format="%.3f",
+            key=price_key,
+            help="默认带出所选 ETF 在所选日期的收盘价；实际成交价不同可直接手工修改。",
+        )
+        fee = c6.number_input("佣金/费用", min_value=0.0, value=0.0, step=0.01, format="%.2f", key="investment_fee")
+        note = c7.text_input("备注", placeholder="可选", key="investment_note")
 
-        submitted = st.form_submit_button("保存记录")
+        if price_lookup["price"] is not None:
+            lookup_date = _date(price_lookup["date"])
+            c5.caption(f"{price_lookup['message']}: {lookup_date} 收盘价 {price_lookup['price']:.3f}")
+        else:
+            c5.caption(price_lookup["message"])
+
+        submitted = st.button("保存记录", type="primary")
         if submitted:
             try:
                 records = append_record(

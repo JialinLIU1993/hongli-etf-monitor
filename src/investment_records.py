@@ -67,6 +67,51 @@ def validate_record(symbol: str, side: str, price: float, quantity: float, fee: 
     return RecordValidationResult(True)
 
 
+def lookup_trade_price(price_frame: pd.DataFrame, date, field: str = "close") -> dict:
+    """Look up a trade-date price, falling back to the previous trading day."""
+    if price_frame is None or price_frame.empty or field not in price_frame.columns:
+        return {
+            "price": None,
+            "date": None,
+            "field": field,
+            "is_exact": False,
+            "message": "没有可用行情",
+        }
+
+    frame = price_frame.sort_index()
+    target = pd.Timestamp(date).normalize()
+    eligible = frame[frame.index.normalize() <= target]
+    if eligible.empty:
+        return {
+            "price": None,
+            "date": None,
+            "field": field,
+            "is_exact": False,
+            "message": "所选日期之前没有行情",
+        }
+
+    row = eligible.iloc[-1]
+    used_date = eligible.index[-1]
+    value = row[field]
+    if pd.isna(value):
+        return {
+            "price": None,
+            "date": used_date,
+            "field": field,
+            "is_exact": used_date.normalize() == target,
+            "message": "所选价格字段为空",
+        }
+
+    is_exact = used_date.normalize() == target
+    return {
+        "price": float(value),
+        "date": used_date,
+        "field": field,
+        "is_exact": is_exact,
+        "message": "匹配所选交易日" if is_exact else "所选日期非交易日，使用此前最近交易日",
+    }
+
+
 def load_records(path: Path = RECORDS_PATH) -> pd.DataFrame:
     """Load local investment records. Missing file is treated as no records."""
     if not path.exists():
