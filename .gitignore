@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local app/runtime state
+.DS_Store
+.streamlit/secrets.toml
+streamlit.log
+
+# Local Codex/editor metadata
+.codex/
+.trae/
+
+# Data and generated artifacts
+data/*.csv
+output/
+*.png
+
+# Keep source, docs, scripts and tests in git; regenerate caches locally.
