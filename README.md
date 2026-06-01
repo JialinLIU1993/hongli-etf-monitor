@@ -10,6 +10,7 @@
 - 双 ETF 最新盯盘状态：最新价、布林带上下轨、中轨、通道位置、目标仓位。
 - 操作触发提示：跌破下轨提示买入/加仓，突破上轨提示卖出/减仓，通道内展示距离触发价。
 - 信号流水：展示布林带规则生成的仓位变化，支持筛选和导出。
+- 投资记录：记录买入/卖出流水，按 FIFO 自动计算已实现收益、浮动收益、当前持仓和历史收益。
 - K线图表：保留 K 线、成交量、布林带和买卖信号标记。
 - 参数优化：保留原项目的布林带 Window x StdDev 网格搜索热力图。
 
@@ -39,9 +40,11 @@ python3 -m streamlit run app.py
 │   ├── tab_monitor.py      # 双 ETF 盯盘总览
 │   ├── tab_kline.py        # K线与布林带
 │   ├── tab_signals.py      # 信号流水
+│   ├── tab_investments.py  # 投资记录与收益统计
 │   └── tab_optimize.py     # 参数优化
 ├── src/
 │   ├── data_loader.py      # AkShare 数据加载与缓存
+│   ├── investment_records.py # 本地投资流水与收益计算
 │   ├── monitoring.py       # 盯盘状态计算
 │   ├── strategies.py       # 布林带策略
 │   └── optimize.py         # 参数优化逻辑
