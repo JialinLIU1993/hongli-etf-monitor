@@ -27,6 +27,95 @@ def _format_date(value):
     return value.strftime("%Y-%m-%d") if hasattr(value, "strftime") else str(value)
 
 
+def _status_tone(status):
+    state = status.get("state", "watch")
+    return {
+        "buy": ("买入触发", "#ef4444", "rgba(254, 242, 242, 0.94)"),
+        "sell": ("卖出触发", "#22c55e", "rgba(240, 253, 244, 0.94)"),
+        "watch": ("通道观察", "#2563eb", "rgba(239, 246, 255, 0.94)"),
+    }.get(state, ("观察", "#2563eb", "rgba(239, 246, 255, 0.94)"))
+
+
+def _add_monitor_annotations(fig, status, row=1, col=1):
+    """Add current monitor state directly onto the K-line chart."""
+    if not status.get("is_ready"):
+        return
+
+    label, color, bg = _status_tone(status)
+    close = status["close"]
+    date = status["date"]
+    lower = status["lower_band"]
+    upper = status["upper_band"]
+
+    fig.add_hline(
+        y=close,
+        line_width=1,
+        line_dash="dot",
+        line_color=color,
+        opacity=0.75,
+        row=row,
+        col=col,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[date],
+            y=[close],
+            mode="markers",
+            name="当前价",
+            marker=dict(size=9, color=color, line=dict(width=2, color="#ffffff")),
+            hovertemplate="当前价 %{y:.3f}<extra></extra>",
+            showlegend=False,
+        ),
+        row=row,
+        col=col,
+    )
+
+    fig.add_annotation(
+        xref="paper",
+        yref="paper",
+        x=0.012,
+        y=1.17,
+        xanchor="left",
+        yanchor="top",
+        align="left",
+        showarrow=False,
+        bgcolor=bg,
+        bordercolor=color,
+        borderwidth=1,
+        borderpad=8,
+        font=dict(size=12, color="#111827"),
+        text=(
+            f"<b>{status['symbol']} {status['name']} · {label}</b><br>"
+            f"现价 <b>{close:.3f}</b> ｜ 目标仓位 <b>{status['target_position']:.0%}</b> ｜ "
+            f"通道位置 <b>{status['channel_position']:.0%}</b><br>"
+            f"下轨 {lower:.3f}（距 {status['dist_to_lower']:.2%}） ｜ "
+            f"上轨 {upper:.3f}（距 {status['dist_to_upper']:.2%}）"
+        ),
+    )
+
+    fig.add_annotation(
+        x=date,
+        y=close,
+        xanchor="left",
+        yanchor="middle",
+        showarrow=True,
+        arrowhead=2,
+        arrowsize=1,
+        arrowwidth=1,
+        arrowcolor=color,
+        ax=34,
+        ay=-24,
+        bgcolor="rgba(255,255,255,0.92)",
+        bordercolor=color,
+        borderwidth=1,
+        borderpad=4,
+        font=dict(size=11, color="#111827"),
+        text=f"现价 {close:.3f}",
+        row=row,
+        col=col,
+    )
+
+
 def render(ctx, title="K线与布林带", compact=False):
     """Render K-line and Bollinger bands for the selected ETF."""
     frames = ctx['frames']
@@ -40,6 +129,7 @@ def render(ctx, title="K线与布林带", compact=False):
         etf_choice = st.radio("选择 ETF", ["510880", "512890"], horizontal=True)
     df_kline = frames[etf_choice].copy()
     profile = profiles[etf_choice]
+    status = ctx["statuses"].get(etf_choice, {})
     param_idx = 1 if etf_choice == "510880" else 2
 
     with control_cols[1]:
@@ -143,17 +233,19 @@ def render(ctx, title="K线与布林带", compact=False):
             name="成交量", marker_color=colors
         ), row=2, col=1)
 
+    _add_monitor_annotations(fig_kline, status)
+
     fig_kline.update_layout(
         template='plotly_white',
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
-        height=460 if compact else 620,
+        height=500 if compact else 660,
         xaxis_rangeslider_visible=False,
         dragmode="pan",
         hovermode="x unified",
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(l=20, r=20, t=64, b=20),
+        margin=dict(l=20, r=20, t=106, b=20),
     )
     fig_kline.update_xaxes(
         gridcolor='#f3f4f6',
