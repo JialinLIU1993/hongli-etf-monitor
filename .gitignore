@@ -13,6 +13,7 @@ env/
 
 # Local app/runtime state
 .DS_Store
+.cache/
 .streamlit/secrets.toml
 streamlit.log
 

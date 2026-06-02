@@ -31,6 +31,36 @@ python3 -m streamlit run app.py
 
 如果仓库内 `.venv/bin/streamlit` 指向旧路径，可以直接使用上面的 `python3 -m streamlit` 启动方式。
 
+## GitHub Actions 信号推送
+
+仓库已包含 `.github/workflows/check-signals.yml`，会每小时运行一次 `scripts/check_signals.py`：
+
+1. 拉取 `510880`、`512890` 前复权日线行情。
+2. 按保留的布林带参数计算目标仓位变化。
+3. 最新交易日出现买入/加仓或卖出/减仓信号时，调用 PushPlus 推送。
+4. 通过 `.cache/check-signals/pushplus_sent.json` 缓存已推送信号，避免每小时重复提醒。
+
+需要在 GitHub 仓库的 `Settings -> Secrets and variables -> Actions` 添加：
+
+- `PUSHPLUS_TOKEN`: 必填，PushPlus 用户令牌或消息令牌。
+- `PUSHPLUS_TOPIC`: 可选，PushPlus 群组编码。
+- `PUSHPLUS_TO`: 可选，好友令牌。不要和 `PUSHPLUS_TOPIC` 同时使用。
+- `PUSHPLUS_CHANNEL`: 可选，指定推送渠道。
+
+本地测试可运行：
+
+```bash
+SIGNAL_DRY_RUN=1 SIGNAL_FORCE_UPDATE=0 python3 scripts/check_signals.py
+```
+
+仓库还包含 `.github/workflows/push-band-status.yml`，会在交易日北京时间 `10:00` 和 `14:00`
+固定推送一次两只 ETF 的布林带状态。内容包括实时价格、布林带上/中/下轨，以及价格在通道内的位置
+（`0%` 为下轨，`50%` 为中轨，`100%` 为上轨）。本地预览可运行：
+
+```bash
+SIGNAL_DRY_RUN=1 SIGNAL_FORCE_UPDATE=0 python3 scripts/check_signals.py --mode status
+```
+
 ## 项目结构
 
 ```text
