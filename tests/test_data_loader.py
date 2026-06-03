@@ -66,6 +66,13 @@ class TestFetchWithMock:
         file_path = os.path.join(self.data_dir, f"{symbol}_{adjust}.csv")
         df.to_csv(file_path)
 
+    def _save_seed(self, symbol, df, adjust='qfq'):
+        seed_dir = os.path.join(self.data_dir, 'seed')
+        os.makedirs(seed_dir, exist_ok=True)
+        file_path = os.path.join(seed_dir, f"{symbol}_{adjust}.csv")
+        df.to_csv(file_path)
+        return seed_dir
+
     @patch('src.data_loader.ak.fund_etf_hist_em')
     def test_full_fetch_no_cache(self, mock_api):
         """无缓存时应全量拉取。"""
@@ -98,6 +105,19 @@ class TestFetchWithMock:
         result = fetch_etf_data("510880", start_date="20230110", end_date="20230120")
         assert not result.empty
         assert not mock_api.called, "缓存命中时不应调用 API"
+
+    @patch('src.data_loader.ak.fund_etf_hist_em')
+    def test_seed_initializes_cache(self, mock_api, monkeypatch):
+        """无运行时缓存但有 seed 数据时，应先用 seed 初始化，避免全量拉取。"""
+        seeded = _normalize(_mock_api_df('2023-01-01', '2023-01-31'))
+        seed_dir = self._save_seed('510880', seeded)
+        monkeypatch.setattr('src.data_loader.SEED_DATA_DIR', seed_dir)
+
+        result = fetch_etf_data("510880", start_date="20230110", end_date="20230120")
+
+        assert not result.empty
+        assert not mock_api.called, "seed 覆盖请求范围时不应调用 API"
+        assert os.path.exists(os.path.join(self.data_dir, "510880_qfq.csv"))
 
     @patch('src.data_loader.ak.fund_etf_hist_em')
     def test_incremental_update(self, mock_api):

@@ -39,6 +39,7 @@ python3 -m streamlit run app.py
 2. 按保留的布林带参数计算目标仓位变化。
 3. 最新交易日出现买入/加仓或卖出/减仓信号时，调用 PushPlus 推送。
 4. 通过 `.cache/check-signals/pushplus_sent.json` 缓存已推送信号，避免每小时重复提醒。
+5. 默认只使用近一年日线，并优先用仓库内 `data/seed/` 初始化行情缓存，避免每次从 2020 年全量拉取。
 
 需要在 GitHub 仓库的 `Settings -> Secrets and variables -> Actions` 添加：
 
@@ -55,7 +56,8 @@ SIGNAL_DRY_RUN=1 SIGNAL_FORCE_UPDATE=0 python3 scripts/check_signals.py
 
 仓库还包含 `.github/workflows/push-band-status.yml`，会在交易日北京时间 `10:00` 和 `14:00`
 固定推送一次两只 ETF 的布林带状态。内容包括实时价格、布林带上/中/下轨，以及价格在通道内的位置
-（`0%` 为下轨，`50%` 为中轨，`100%` 为上轨）。本地预览可运行：
+（`0%` 为下轨，`50%` 为中轨，`100%` 为上轨）。状态推送默认只拉近一年日线，并在 GitHub Actions
+缓存 `data/`，减少行情接口短暂断连导致的漏推。本地预览可运行：
 
 ```bash
 SIGNAL_DRY_RUN=1 SIGNAL_FORCE_UPDATE=0 python3 scripts/check_signals.py --mode status

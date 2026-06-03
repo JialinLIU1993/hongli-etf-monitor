@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Shanghai
+      SIGNAL_FORCE_UPDATE: "0"
       PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
       PUSHPLUS_TOPIC: ${{ secrets.PUSHPLUS_TOPIC }}
       PUSHPLUS_TO: ${{ secrets.PUSHPLUS_TO }}
@@ -32,8 +33,26 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      - name: Prepare data cache directory
+        run: mkdir -p data
+
+      - name: Restore ETF data cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: etf-data-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            etf-data-
+
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
       - name: Push current ETF band status
         run: python scripts/check_signals.py --mode status
+
+      - name: Save ETF data cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: etf-data-${{ github.run_id }}-${{ github.run_attempt }}

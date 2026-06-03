@@ -10,7 +10,7 @@ import os
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -33,6 +33,7 @@ from src.monitoring import (  # noqa: E402
 LOGGER = logging.getLogger("check_signals")
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
 DEFAULT_STATE_FILE = ROOT / ".cache" / "check-signals" / "pushplus_sent.json"
+DEFAULT_LOOKBACK_DAYS = 370
 PROXY_ENV_KEYS = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -116,6 +117,10 @@ def parse_symbols(raw: str | None) -> list[str]:
     if unknown:
         raise ValueError(f"Unknown ETF symbol(s): {', '.join(unknown)}")
     return symbols
+
+
+def default_start_date(now: datetime) -> str:
+    return (now - timedelta(days=DEFAULT_LOOKBACK_DAYS)).strftime("%Y%m%d")
 
 
 @contextmanager
@@ -540,8 +545,9 @@ def run_status_mode(args: argparse.Namespace, *, now: datetime, symbols: list[st
         return 0
 
     statuses: list[BandStatus] = []
+    start_date = args.status_start_date or args.start_date or default_start_date(now)
     for symbol in symbols:
-        status = summarize_symbol(symbol, start_date=args.start_date, force_update=args.force_update)
+        status = summarize_symbol(symbol, start_date=start_date, force_update=args.force_update)
         band_status = build_band_status(status, quotes.get(symbol))
         if band_status is None:
             continue
@@ -595,8 +601,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--start-date",
-        default=os.getenv("SIGNAL_START_DATE", "20200102"),
-        help="History start date passed to AkShare, format YYYYMMDD.",
+        default=os.getenv("SIGNAL_START_DATE"),
+        help="History start date passed to AkShare, format YYYYMMDD. Defaults to about one year ago.",
+    )
+    parser.add_argument(
+        "--status-start-date",
+        default=os.getenv("STATUS_START_DATE"),
+        help="History start date used by status mode. Defaults to about one year ago.",
     )
     parser.add_argument(
         "--symbols",
@@ -657,9 +668,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_status_mode(args, now=now, symbols=symbols)
 
     alerts: list[SignalAlert] = []
+    start_date = args.start_date or default_start_date(now)
 
     for symbol in symbols:
-        status = summarize_symbol(symbol, start_date=args.start_date, force_update=args.force_update)
+        status = summarize_symbol(symbol, start_date=start_date, force_update=args.force_update)
         if status.get("is_ready"):
             LOGGER.info(
                 "%s %s | date=%s close=%.3f signal=%s target=%.0f%% state=%s",

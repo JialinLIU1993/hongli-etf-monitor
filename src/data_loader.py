@@ -2,12 +2,15 @@ import akshare as ak
 import pandas as pd
 import os
 import logging
+import shutil
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
 DATA_DIR = 'data'
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+SEED_DATA_DIR = os.path.join(ROOT_DIR, 'data', 'seed')
 _PROXY_ENV_KEYS = (
     'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
     'http_proxy', 'https_proxy', 'all_proxy',
@@ -35,10 +38,39 @@ def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
+def _seed_cache_if_available(file_path, symbol, adjust):
+    """首次运行时用仓库内近一年 seed 数据初始化本地缓存。"""
+    if os.path.exists(file_path):
+        return
+
+    seed_path = os.path.join(SEED_DATA_DIR, f"{symbol}_{adjust}.csv")
+    if not os.path.exists(seed_path):
+        return
+
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    shutil.copyfile(seed_path, file_path)
+    logger.info(f"使用 seed 数据初始化 {symbol} 缓存: {seed_path} → {file_path}")
+
+
 def _is_proxy_error(error):
     """判断 AkShare 底层请求是否卡在代理上。"""
     text = f"{type(error).__name__}: {error}".lower()
     return "proxy" in text
+
+
+def _is_retryable_network_error(error):
+    """判断是否属于短暂网络断连，可换环境重试一次。"""
+    text = f"{type(error).__name__}: {error}".lower()
+    retryable_phrases = (
+        "remote disconnected",
+        "connection aborted",
+        "connection reset",
+        "max retries exceeded",
+        "timed out",
+        "timeout",
+        "ssl",
+    )
+    return any(phrase in text for phrase in retryable_phrases)
 
 
 @contextmanager
@@ -76,9 +108,9 @@ def _fetch_from_api(symbol, start_date, end_date, adjust):
             start_date=start_date, end_date=end_date, adjust=adjust
         )
     except Exception as e:
-        if not _is_proxy_error(e):
+        if not (_is_proxy_error(e) or _is_retryable_network_error(e)):
             raise
-        logger.warning(f"API 拉取遇到代理错误，临时绕过代理重试: {e}")
+        logger.warning(f"API 拉取遇到网络错误，临时绕过代理重试: {e}")
         with _without_proxy_env():
             df = ak.fund_etf_hist_em(
                 symbol=symbol, period="daily",
@@ -101,6 +133,7 @@ def fetch_etf_data(symbol="510880", start_date="20200101", end_date=None,
     """
     ensure_data_dir()
     file_path = os.path.join(DATA_DIR, f"{symbol}_{adjust}.csv")
+    _seed_cache_if_available(file_path, symbol, adjust)
 
     if end_date is None:
         end_date = datetime.now().strftime("%Y%m%d")
