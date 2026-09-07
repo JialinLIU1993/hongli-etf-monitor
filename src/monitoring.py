@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 
 import pandas as pd
 
 from .strategies import BollingerBandsStrategy
+from .config import BOLLINGER_510880, BOLLINGER_512890
 
 
 @dataclass(frozen=True)
@@ -23,17 +25,13 @@ ETF_PROFILES = {
         symbol="510880",
         name="红利 ETF",
         role="进攻端",
-        window=40,
-        num_std=2.1,
-        first_batch_pct=0.9,
+        **BOLLINGER_510880,
     ),
     "512890": EtfProfile(
         symbol="512890",
         name="红利低波",
         role="防守端",
-        window=50,
-        num_std=2.1,
-        first_batch_pct=1.0,
+        **BOLLINGER_512890,
     ),
 }
 
@@ -108,7 +106,7 @@ def summarize_monitor_status(
             "message": "无可用数据",
         }
 
-    usable = frame.dropna(subset=["ma", "upper_band", "lower_band"])
+    usable = frame.dropna(subset=["ma", "upper_band", "lower_band", "close", "position"])
     if usable.empty:
         return {
             "symbol": symbol,
@@ -118,7 +116,13 @@ def summarize_monitor_status(
             "message": f"数据不足，至少需要 {window} 个交易日计算布林带",
         }
 
-    latest = usable.iloc[-1]
+    latest = frame.iloc[-1]
+    if not all(isfinite(float(latest[column])) for column in
+               ["ma", "upper_band", "lower_band", "close", "position"]) or latest["close"] <= 0:
+        return {
+            "symbol": symbol, "name": name, "role": role, "is_ready": False,
+            "message": "最新交易日行情或指标不完整，请刷新后重试。",
+        }
     close = float(latest["close"])
     upper = float(latest["upper_band"])
     lower = float(latest["lower_band"])
@@ -131,12 +135,12 @@ def summarize_monitor_status(
     dist_to_lower = (close - lower) / close if close else 0.0
     dist_to_upper = (upper - close) / close if close else 0.0
 
-    if close <= lower:
+    if close < lower:
         state = "buy"
         state_label = "触发买入/加仓"
         priority = 1
         hint = "价格已跌破下轨，按保留的布林带分批规则检查买入或加仓。"
-    elif close >= upper:
+    elif close > upper:
         state = "sell"
         state_label = "触发卖出/减仓"
         priority = 2

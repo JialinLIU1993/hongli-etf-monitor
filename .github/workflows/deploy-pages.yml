@@ -1,0 +1,47 @@
+name: Deploy GitHub Pages
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '30 8 * * 1-5'
+permissions:
+  contents: read
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+      - name: Build public assets
+        env:
+          ETF_DATA_PROVIDER: ${{ vars.ETF_DATA_PROVIDER || 'akshare' }}
+          HITHINK_FINANCE_API_KEY: ${{ secrets.HITHINK_FINANCE_API_KEY }}
+          REFRESH: ${{ github.event_name != 'push' && '--refresh' || '' }}
+        run: python scripts/build_pages.py $REFRESH
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: output/pages
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

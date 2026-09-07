@@ -6,6 +6,7 @@ import argparse
 import html
 import json
 import logging
+import math
 import os
 import sys
 from contextlib import contextmanager
@@ -23,6 +24,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.data_loader import fetch_etf_data  # noqa: E402
+from src.data_sources import (  # noqa: E402
+    PRICE_BASIS_LABELS,
+    PROVIDER_LABELS,
+    get_hithink_api_key,
+    resolve_provider,
+)
+from src.hithink_api import HithinkClient  # noqa: E402
 from src.monitoring import (  # noqa: E402
     ETF_PROFILES,
     calculate_monitor_frame,
@@ -61,13 +69,16 @@ class SignalAlert:
     hint: str
     window: int
     num_std: float
+    provider: str = "akshare"
+    price_basis: str = PRICE_BASIS_LABELS["akshare"]
 
     @property
     def key(self) -> str:
-        return (
+        key = (
             f"{self.symbol}:{self.date}:{self.action}:"
             f"{self.signal:.6f}:{self.target_position:.6f}"
         )
+        return key if self.provider == "akshare" else f"{self.provider}:{key}"
 
 
 @dataclass(frozen=True)
@@ -75,6 +86,7 @@ class RealtimeQuote:
     symbol: str
     price: float
     quote_time: datetime | None
+    provider: str = "akshare"
 
 
 @dataclass(frozen=True)
@@ -93,6 +105,8 @@ class BandStatus:
     position_label: str
     window: int
     num_std: float
+    provider: str = "akshare"
+    price_basis: str = PRICE_BASIS_LABELS["akshare"]
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -112,7 +126,9 @@ def env_int(name: str, default: int) -> int:
 def parse_symbols(raw: str | None) -> list[str]:
     if not raw:
         return list(ETF_PROFILES.keys())
-    symbols = [item.strip() for item in raw.split(",") if item.strip()]
+    symbols = list(dict.fromkeys(item.strip() for item in raw.split(",") if item.strip()))
+    if not symbols:
+        raise ValueError("At least one ETF symbol is required.")
     unknown = sorted(set(symbols) - set(ETF_PROFILES))
     if unknown:
         raise ValueError(f"Unknown ETF symbol(s): {', '.join(unknown)}")
@@ -188,7 +204,7 @@ def parse_quote_float(value: Any) -> float | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    return number if number > 0 else None
+    return number if math.isfinite(number) and number > 0 else None
 
 
 def secid_for_symbol(symbol: str) -> str:
@@ -220,10 +236,15 @@ def fetch_realtime_quotes_once(
         raw = request.urlopen(req, timeout=env_int("QUOTE_TIMEOUT", 15)).read().decode("utf-8")
 
     data = json.loads(raw)
-    rows = data.get("data", {}).get("diff") or []
+    payload = data.get("data") if isinstance(data, dict) else None
+    rows = (payload.get("diff") or []) if isinstance(payload, dict) else []
+    if isinstance(rows, dict):
+        rows = rows.values()
     quotes: dict[str, RealtimeQuote] = {}
 
     for row in rows:
+        if not isinstance(row, dict):
+            continue
         symbol = str(row.get("f12", "")).strip()
         if symbol not in symbols:
             continue
@@ -235,14 +256,66 @@ def fetch_realtime_quotes_once(
         quote_time = None
         timestamp = parse_quote_float(row.get("f124"))
         if timestamp is not None:
-            quote_time = datetime.fromtimestamp(timestamp, timezone)
+            try:
+                quote_time = datetime.fromtimestamp(timestamp, timezone)
+            except (OverflowError, OSError, ValueError):
+                LOGGER.warning("Invalid quote timestamp for %s", symbol)
 
         quotes[symbol] = RealtimeQuote(symbol=symbol, price=price, quote_time=quote_time)
 
     return quotes
 
 
-def fetch_realtime_quotes(symbols: list[str], *, timezone: ZoneInfo) -> dict[str, RealtimeQuote]:
+def fetch_hithink_realtime_quotes(
+    symbols: list[str], *, timezone: ZoneInfo, api_key: str | None = None,
+) -> dict[str, RealtimeQuote]:
+    """Keep failed quotes on this provider; status mode may use its daily close."""
+    key = get_hithink_api_key(api_key)
+    if not key:
+        LOGGER.warning("同花顺 Financial API 尚未配置 HITHINK_FINANCE_API_KEY。")
+        return {}
+    try:
+        client = HithinkClient(key)
+    except Exception:
+        LOGGER.warning("同花顺 Financial API 初始化失败，请检查配置。")
+        return {}
+
+    quotes: dict[str, RealtimeQuote] = {}
+    for symbol in symbols:
+        try:
+            snapshot = client.fetch_etf_snapshot(symbol)
+            if not isinstance(snapshot, dict) or snapshot.get("symbol") != symbol:
+                continue
+            price = parse_quote_float(snapshot.get("price"))
+            if price is None:
+                continue
+            quote_time = None
+            raw_time = snapshot.get("quote_time")
+            if raw_time is not None:
+                try:
+                    timestamp = pd.Timestamp(raw_time)
+                    if not pd.isna(timestamp):
+                        timestamp = (
+                            timestamp.tz_localize(timezone) if timestamp.tzinfo is None
+                            else timestamp.tz_convert(timezone)
+                        )
+                        quote_time = timestamp.to_pydatetime()
+                except (TypeError, ValueError, OverflowError):
+                    LOGGER.warning("同花顺 Financial API %s 报价时间无效。", symbol)
+            quotes[symbol] = RealtimeQuote(symbol, price, quote_time, provider="hithink")
+        except Exception:
+            # Third-party exception text can contain request headers or credentials.
+            LOGGER.warning("同花顺 Financial API %s 实时行情暂不可用，将使用本来源日线。", symbol)
+    return quotes
+
+
+def fetch_realtime_quotes(
+    symbols: list[str], *, timezone: ZoneInfo,
+    provider: str | None = None, api_key: str | None = None,
+) -> dict[str, RealtimeQuote]:
+    provider = resolve_provider(provider)
+    if provider == "hithink":
+        return fetch_hithink_realtime_quotes(symbols, timezone=timezone, api_key=api_key)
     try:
         return fetch_realtime_quotes_once(symbols, timezone=timezone)
     except Exception as exc:
@@ -269,13 +342,35 @@ def describe_band_position(value: float) -> str:
     return "上轨附近"
 
 
+def _usable_status(status: dict[str, Any], *, today: datetime | None = None) -> bool:
+    """Reject corrupt or future market observations before rendering notifications."""
+    if not status.get("is_ready"):
+        return False
+    try:
+        date = pd.Timestamp(status["date"])
+        values = [float(status[key]) for key in ("close", "ma", "lower_band", "upper_band")]
+        if pd.isna(date) or not all(math.isfinite(value) for value in values):
+            return False
+        if today is not None and date.date() > today.date():
+            return False
+        for key in ("signal", "target_position"):
+            if key in status and not math.isfinite(float(status[key])):
+                return False
+        if "target_position" in status and not 0 <= float(status["target_position"]) <= 1:
+            return False
+        close, ma, lower, upper = values
+        return close > 0 and ma > 0 and lower <= ma <= upper
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
 def build_alert(
     status: dict[str, Any],
     *,
     today: datetime,
     max_signal_age_days: int,
 ) -> SignalAlert | None:
-    if not status.get("is_ready"):
+    if not _usable_status(status, today=today):
         LOGGER.warning(
             "%s %s is not ready: %s",
             status.get("symbol"),
@@ -284,7 +379,13 @@ def build_alert(
         )
         return None
 
-    signal = float(status.get("signal") or 0.0)
+    try:
+        signal = float(status.get("signal", 0.0))
+        target_position = float(status["target_position"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(signal) or not math.isfinite(target_position) or not 0 <= target_position <= 1:
+        return None
     if abs(signal) < 1e-9:
         return None
 
@@ -309,7 +410,7 @@ def build_alert(
         action=action,
         change=status["signal_change"],
         signal=signal,
-        target_position=float(status["target_position"]),
+        target_position=target_position,
         close=float(status["close"]),
         ma=float(status["ma"]),
         lower_band=float(status["lower_band"]),
@@ -317,25 +418,39 @@ def build_alert(
         hint=str(status["hint"]),
         window=int(status["window"]),
         num_std=float(status["num_std"]),
+        provider=status.get("provider", "akshare"),
+        price_basis=status.get(
+            "price_basis", PRICE_BASIS_LABELS.get(status.get("provider", "akshare"), "未知口径"),
+        ),
     )
 
 
-def summarize_symbol(symbol: str, *, start_date: str, force_update: bool) -> dict[str, Any]:
+def summarize_symbol(
+    symbol: str, *, start_date: str, force_update: bool,
+    provider: str | None = None, api_key: str | None = None,
+) -> dict[str, Any]:
+    provider = resolve_provider(provider)
     profile = ETF_PROFILES[symbol]
-    df = fetch_etf_data(
-        symbol=symbol,
-        start_date=start_date,
-        adjust="qfq",
-        force_update=force_update,
-    )
+    metadata = {
+        "symbol": symbol,
+        "name": profile.name,
+        "role": profile.role,
+        "provider": provider,
+        "price_basis": PRICE_BASIS_LABELS[provider],
+    }
+    try:
+        df = fetch_etf_data(
+            symbol=symbol,
+            start_date=start_date,
+            force_update=force_update,
+            provider=provider,
+            api_key=api_key,
+        )
+    except Exception:
+        LOGGER.warning("%s %s 日线请求失败，请检查来源配置和网络。", PROVIDER_LABELS[provider], symbol)
+        return {**metadata, "is_ready": False, "message": "所选来源行情请求失败"}
     if df.empty:
-        return {
-            "symbol": symbol,
-            "name": profile.name,
-            "role": profile.role,
-            "is_ready": False,
-            "message": "行情数据为空",
-        }
+        return {**metadata, "is_ready": False, "message": "所选来源行情数据为空"}
 
     frame = calculate_monitor_frame(
         df,
@@ -343,7 +458,7 @@ def summarize_symbol(symbol: str, *, start_date: str, force_update: bool) -> dic
         num_std=profile.num_std,
         first_batch_pct=profile.first_batch_pct,
     )
-    return summarize_monitor_status(
+    status = summarize_monitor_status(
         frame,
         symbol=symbol,
         name=profile.name,
@@ -352,10 +467,14 @@ def summarize_symbol(symbol: str, *, start_date: str, force_update: bool) -> dic
         num_std=profile.num_std,
         first_batch_pct=profile.first_batch_pct,
     )
+    status.update(metadata)
+    return status
 
 
-def build_band_status(status: dict[str, Any], quote: RealtimeQuote | None) -> BandStatus | None:
-    if not status.get("is_ready"):
+def build_band_status(
+    status: dict[str, Any], quote: RealtimeQuote | None, *, today: datetime | None = None,
+) -> BandStatus | None:
+    if not _usable_status(status, today=today):
         LOGGER.warning(
             "%s %s is not ready: %s",
             status.get("symbol"),
@@ -364,6 +483,13 @@ def build_band_status(status: dict[str, Any], quote: RealtimeQuote | None) -> Ba
         )
         return None
 
+    if quote is not None and (
+        quote.symbol != status["symbol"] or parse_quote_float(quote.price) is None
+        or quote.provider != status.get("provider", "akshare")
+        or (today is not None and quote.quote_time is not None
+            and quote.quote_time.date() > today.date())
+    ):
+        quote = None
     price = quote.price if quote else float(status["close"])
     price_source = "实时价" if quote else "最新日线收盘价"
     lower = float(status["lower_band"])
@@ -386,6 +512,10 @@ def build_band_status(status: dict[str, Any], quote: RealtimeQuote | None) -> Ba
         position_label=describe_band_position(band_position),
         window=int(status["window"]),
         num_std=float(status["num_std"]),
+        provider=status.get("provider", "akshare"),
+        price_basis=status.get(
+            "price_basis", PRICE_BASIS_LABELS.get(status.get("provider", "akshare"), "未知口径"),
+        ),
     )
 
 
@@ -404,6 +534,8 @@ def render_content(alerts: list[SignalAlert], *, generated_at: datetime) -> str:
                     "<ul>",
                     f"<li>信号: {html.escape(alert.action)} {html.escape(alert.change)}</li>",
                     f"<li>数据日期: {html.escape(alert.date)}</li>",
+                    f"<li>行情来源: {html.escape(PROVIDER_LABELS.get(alert.provider, alert.provider))}</li>",
+                    f"<li>价格口径: {html.escape(alert.price_basis)}</li>",
                     f"<li>最新价: {alert.close:.3f}</li>",
                     f"<li>目标仓位: {alert.target_position:.0%}</li>",
                     (
@@ -451,6 +583,8 @@ def render_band_status_content(statuses: list[BandStatus], *, generated_at: date
                         f"({html.escape(status.position_label)}，0%=下轨，50%=中轨，100%=上轨)</li>"
                     ),
                     f"<li>布林带数据日期: {html.escape(status.band_date)}</li>",
+                    f"<li>行情来源: {html.escape(PROVIDER_LABELS.get(status.provider, status.provider))}</li>",
+                    f"<li>价格口径: {html.escape(status.price_basis)}</li>",
                     f"<li>参数: Window={status.window}, Std={status.num_std:g}</li>",
                     "</ul>",
                 ]
@@ -516,7 +650,9 @@ def send_pushplus(title: str, content: str) -> dict[str, Any]:
 
 
 def run_status_mode(args: argparse.Namespace, *, now: datetime, symbols: list[str]) -> int:
-    quotes = fetch_realtime_quotes(symbols, timezone=now.tzinfo or ZoneInfo("Asia/Shanghai"))
+    quotes = fetch_realtime_quotes(
+        symbols, timezone=now.tzinfo or ZoneInfo("Asia/Shanghai"), provider=args.provider,
+    )
     if args.require_today_quote:
         missing_today_quotes = [
             symbol
@@ -547,8 +683,10 @@ def run_status_mode(args: argparse.Namespace, *, now: datetime, symbols: list[st
     statuses: list[BandStatus] = []
     start_date = args.status_start_date or args.start_date or default_start_date(now)
     for symbol in symbols:
-        status = summarize_symbol(symbol, start_date=start_date, force_update=args.force_update)
-        band_status = build_band_status(status, quotes.get(symbol))
+        status = summarize_symbol(
+            symbol, start_date=start_date, force_update=args.force_update, provider=args.provider,
+        )
+        band_status = build_band_status(status, quotes.get(symbol), today=now)
         if band_status is None:
             continue
         statuses.append(band_status)
@@ -588,6 +726,12 @@ def run_status_mode(args: argparse.Namespace, *, now: datetime, symbols: list[st
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--provider",
+        choices=tuple(PROVIDER_LABELS),
+        default=os.getenv("ETF_DATA_PROVIDER", "akshare"),
+        help="Market data provider; hithink requires HITHINK_FINANCE_API_KEY.",
+    )
+    parser.add_argument(
         "--mode",
         choices=("signals", "status"),
         default=os.getenv("CHECK_SIGNALS_MODE", "signals"),
@@ -602,7 +746,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--start-date",
         default=os.getenv("SIGNAL_START_DATE"),
-        help="History start date passed to AkShare, format YYYYMMDD. Defaults to about one year ago.",
+        help="History start date passed to the data provider, format YYYYMMDD. Defaults to about one year ago.",
     )
     parser.add_argument(
         "--status-start-date",
@@ -630,7 +774,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--force-update",
         action=argparse.BooleanOptionalAction,
         default=env_bool("SIGNAL_FORCE_UPDATE", True),
-        help="Force AkShare refresh instead of using local cache.",
+        help="Force a refresh from the selected data provider instead of using local cache.",
     )
     parser.add_argument(
         "--skip-weekends",
@@ -650,6 +794,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     args = parse_args(argv)
+    try:
+        args.provider = resolve_provider(args.provider)
+    except ValueError as exc:
+        LOGGER.error("%s", exc)
+        return 1
+    if args.provider == "hithink" and not get_hithink_api_key():
+        LOGGER.error("同花顺 Financial API 尚未配置 HITHINK_FINANCE_API_KEY；本次检查未执行。")
+        return 1
 
     os.chdir(ROOT)
     timezone = ZoneInfo(os.getenv("SIGNAL_TIMEZONE", "Asia/Shanghai"))
@@ -657,7 +809,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.skip_weekends and now.weekday() >= 5:
         LOGGER.info("Today is weekend in %s, skip signal check.", timezone.key)
-        save_state(args.state_file, load_state(args.state_file))
+        if not args.dry_run:
+            save_state(args.state_file, load_state(args.state_file))
         return 0
 
     state = load_state(args.state_file)
@@ -668,11 +821,15 @@ def main(argv: list[str] | None = None) -> int:
         return run_status_mode(args, now=now, symbols=symbols)
 
     alerts: list[SignalAlert] = []
+    usable_count = 0
     start_date = args.start_date or default_start_date(now)
 
     for symbol in symbols:
-        status = summarize_symbol(symbol, start_date=start_date, force_update=args.force_update)
-        if status.get("is_ready"):
+        status = summarize_symbol(
+            symbol, start_date=start_date, force_update=args.force_update, provider=args.provider,
+        )
+        if _usable_status(status, today=now):
+            usable_count += 1
             LOGGER.info(
                 "%s %s | date=%s close=%.3f signal=%s target=%.0f%% state=%s",
                 symbol,
@@ -694,10 +851,15 @@ def main(argv: list[str] | None = None) -> int:
 
         alerts.append(alert)
 
+    if not usable_count:
+        LOGGER.error("No usable ETF data; signal check could not be completed.")
+        return 1
+
     if not alerts:
         LOGGER.info("No new buy/sell signals.")
-        prune_state(state)
-        save_state(args.state_file, state)
+        if not args.dry_run:
+            prune_state(state)
+            save_state(args.state_file, state)
         return 0
 
     title = f"红利双雄 ETF 信号提醒 ({len(alerts)} 条)"
@@ -723,6 +885,8 @@ def main(argv: list[str] | None = None) -> int:
             "action": alert.action,
             "change": alert.change,
             "target_position": alert.target_position,
+            "provider": alert.provider,
+            "price_basis": alert.price_basis,
             "pushplus_message_id": result.get("data"),
         }
 

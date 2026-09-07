@@ -1,118 +1,85 @@
-from .data_loader import fetch_etf_data
-from .strategies import BollingerBandsStrategy
-from .backtest import BacktestEngine
-import pandas as pd
-import numpy as np
-import itertools
+"""Bollinger parameter searches using the same backtest model as reports."""
 
-def optimize_bollinger(df, mode='standard'):
+import numpy as np
+import pandas as pd
+
+from .backtest import BacktestEngine
+from .strategies import BollingerBandsStrategy
+
+
+def optimize_bollinger(df, mode='standard', *, windows=None, num_stds=None,
+                       first_batch_pct=1.0, scale_threshold=0.02,
+                       pyramid_levels=None, pyramid_sizes=None):
+    """Search Window × StdDev, or batch sizes with fixed Window=40 / Std=2.1.
+
+    Custom grids and staged settings allow the UI to evaluate its current data
+    and configuration. Search results omit expensive per-trade FIFO statistics.
     """
-    Run Bollinger Bands optimization.
-    mode: 
-        'standard' - Grid search Window (10-90) x StdDev (1.5-3.5)
-        'batch'    - Grid search First Batch Pct (0.1-0.9) with fixed Window=40, Std=2.1
-    """
-    results = []
+    if mode not in {'standard', 'batch'}:
+        raise ValueError("mode must be 'standard' or 'batch'")
+    columns = ['window', 'num_std']
+    if mode == 'batch':
+        columns.append('first_batch_pct')
+    columns += ['Total Return', 'Sharpe Ratio', 'Max Drawdown']
+    if df.empty:
+        return pd.DataFrame(columns=columns)
 
     if mode == 'standard':
-        # Parameter ranges
-        windows = range(10, 95, 5) # 10 to 90
-        num_stds = np.arange(1.5, 3.6, 0.1) # 1.5 to 3.5
-        
-        # Use fixed reasonable defaults for others
-        FIXED_STAGED = True
-        FIXED_THRESHOLD = 0.02
-        FIXED_PCT = 1.0 # Standard usually implies All-in or simple staged. 
-                        # To keep heatmap comparable to current "Best", let's use PCT=1.0 (All-in) 
-                        # OR use the PCT=0.9 found. 
-                        # Let's use PCT=1.0 (All-in) as that was the baseline for the heatmap originally.
-        
-        total_combinations = len(windows) * len(num_stds)
-        print(f"Starting Standard Grid Search on {total_combinations} combinations (Window x Std)...")
-        
-        for window in windows:
-            for num_std in num_stds:
-                strategy = BollingerBandsStrategy(
-                    window=window, 
-                    num_std=num_std, 
-                    staged=FIXED_STAGED, 
-                    scale_threshold=FIXED_THRESHOLD,
-                    first_batch_pct=FIXED_PCT
-                )
-                engine = BacktestEngine(strategy, df.copy(), initial_capital=100000, commission=0.0003)
-                engine.run()
-                metrics = engine.calculate_metrics()
-                
-                results.append({
-                    'window': window,
-                    'num_std': round(num_std, 1),
-                    'Total Return': metrics.get('Total Return', 0),
-                    'Sharpe Ratio': metrics.get('Sharpe Ratio', 0),
-                    'Max Drawdown': metrics.get('Max Drawdown', 0)
-                })
+        windows = tuple(range(10, 95, 5) if windows is None else windows)
+        num_stds = tuple(np.arange(1.5, 3.6, 0.1) if num_stds is None else num_stds)
+        combinations = ((window, num_std, first_batch_pct)
+                        for window in windows for num_std in num_stds)
+    else:
+        combinations = ((40, 2.1, pct) for pct in np.arange(0.1, 1.0, 0.1))
 
-    elif mode == 'batch':
-        # Fixed Parameters (from previous optimization)
-        FIXED_WINDOW = 40
-        FIXED_STD = 2.1
-        FIXED_THRESHOLD = 0.02
-        
-        # Optimize First Batch Percentage
-        first_batch_pcts = np.arange(0.1, 1.0, 0.1) # 10% to 90%
-        
-        print(f"Starting Batch Size Optimization (Window={FIXED_WINDOW}, Std={FIXED_STD})...")
-        
-        for pct in first_batch_pcts:
-            strategy = BollingerBandsStrategy(
-                window=FIXED_WINDOW, 
-                num_std=FIXED_STD, 
-                staged=True, 
-                scale_threshold=FIXED_THRESHOLD,
-                first_batch_pct=pct
-            )
-            engine = BacktestEngine(strategy, df.copy(), initial_capital=100000, commission=0.0003)
-            engine.run()
-            metrics = engine.calculate_metrics()
-            
-            results.append({
-                'window': FIXED_WINDOW,
-                'num_std': FIXED_STD,
-                'first_batch_pct': round(pct, 1),
-                'Total Return': metrics.get('Total Return', 0),
-                'Sharpe Ratio': metrics.get('Sharpe Ratio', 0),
-                'Max Drawdown': metrics.get('Max Drawdown', 0)
-            })
-            
-    results_df = pd.DataFrame(results)
-    return results_df
+    results = []
+    for window, num_std, pct in combinations:
+        strategy = BollingerBandsStrategy(
+            window=window,
+            num_std=num_std,
+            staged=True,
+            scale_threshold=scale_threshold,
+            first_batch_pct=pct,
+            pyramid_levels=pyramid_levels,
+            pyramid_sizes=pyramid_sizes,
+        )
+        # Signal generation already copies its input; an extra full-frame copy
+        # for each grid point is unnecessary.
+        engine = BacktestEngine(strategy, df, initial_capital=100000, commission=0.0003)
+        engine.run()
+        metrics = engine.calculate_metrics(include_trade_stats=False)
+        result = {
+            'window': window,
+            'num_std': round(num_std, 1),
+            'Total Return': metrics['Total Return'],
+            'Sharpe Ratio': metrics['Sharpe Ratio'],
+            'Max Drawdown': metrics['Max Drawdown'],
+        }
+        if mode == 'batch':
+            result['first_batch_pct'] = round(pct, 1)
+        results.append(result)
+    return pd.DataFrame(results, columns=columns)
+
 
 def main():
-    symbol = "510880"
-    print(f"Fetching data for {symbol}...")
-    df = fetch_etf_data(symbol, start_date="20200101")
-    
+    from .data_loader import fetch_etf_data
+
+    symbol = '510880'
+    print(f'Fetching data for {symbol}...')
+    df = fetch_etf_data(symbol, start_date='20200101')
     if df.empty:
-        print("No data found.")
+        print('No data found.')
         return
 
-    results_df = optimize_bollinger(df)
-    
-    # Sort by Total Return
-    top_10 = results_df.sort_values(by='Total Return', ascending=False)
-    
-    print("\n" + "="*50)
-    print("OPTIMIZATION RESULTS (Batch Size Ratio)")
-    print("="*50)
-    print(top_10.to_string(index=False))
-    
-    # Best Param
-    best = top_10.iloc[0]
-    print("\n" + "="*50)
-    print(f"🏆 BEST BATCH DISTRIBUTION:")
-    print(f"First Batch: {best['first_batch_pct']:.0%}")
-    print(f"Second Batch: {1 - best['first_batch_pct']:.0%}")
+    # This report displays batch percentages, so explicitly run the batch mode.
+    results = optimize_bollinger(df, mode='batch').sort_values('Total Return', ascending=False)
+    print('\nOPTIMIZATION RESULTS (Batch Size Ratio)')
+    print(results.to_string(index=False))
+    best = results.iloc[0]
+    print(f"\nBest first batch: {best['first_batch_pct']:.0%}")
+    print(f"Second batch: {1 - best['first_batch_pct']:.0%}")
     print(f"Total Return: {best['Total Return']:.2%}")
-    print("="*50)
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()

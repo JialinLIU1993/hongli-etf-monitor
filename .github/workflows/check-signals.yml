@@ -17,6 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Shanghai
+      ETF_DATA_PROVIDER: ${{ vars.ETF_DATA_PROVIDER || 'akshare' }}
+      HITHINK_FINANCE_API_KEY: ${{ secrets.HITHINK_FINANCE_API_KEY }}
       SIGNAL_FORCE_UPDATE: "0"
       SIGNAL_STATE_FILE: .cache/check-signals/pushplus_sent.json
       PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}

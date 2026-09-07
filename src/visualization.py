@@ -33,11 +33,11 @@ def plot_performance(engine, save_path=None):
 
     # Plot Signals
     # Buy Signals
-    buys = results[results['signal'] == 1]
+    buys = results[results['signal'] > 0]
     ax1.scatter(buys.index, results.loc[buys.index, 'close'], marker='^', color='green', label='Buy Signal', s=100, zorder=5)
     
     # Sell Signals
-    sells = results[results['signal'] == -1]
+    sells = results[results['signal'] < 0]
     ax1.scatter(sells.index, results.loc[sells.index, 'close'], marker='v', color='red', label='Sell Signal', s=100, zorder=5)
     
     ax1.set_title(f'{strategy_name} - Analysis', fontsize=14, fontweight='bold')
@@ -60,7 +60,7 @@ def plot_performance(engine, save_path=None):
     # --- Subplot 3: Drawdown ---
     # Calculate drawdown if not present (though engine calculates metrics, it might not store daily drawdown series in df)
     # Re-calculate for plotting
-    rolling_max = results['equity'].cummax()
+    rolling_max = results['equity'].cummax().clip(lower=engine.initial_capital)
     drawdown = (results['equity'] - rolling_max) / rolling_max
     
     ax3.fill_between(results.index, drawdown * 100, 0, color='red', alpha=0.3)

@@ -1,10 +1,11 @@
 """Investment record tab."""
+import math
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from src.investment_records import (
-    RECORDS_PATH,
     append_record,
     calculate_investment_summary,
     delete_records,
@@ -108,7 +109,7 @@ def _render_summary(summary):
     cols[1].metric("已实现收益", _money(summary["realized_pnl"]), _pct(summary["realized_return"]), delta_color="inverse")
     cols[2].metric("浮动收益", _money(summary["unrealized_pnl"]))
     cols[3].metric("当前市值", _money(summary["market_value"]))
-    cols[4].metric("投入成本口径", _money(summary["capital_base"]))
+    cols[4].metric("投入成本", _money(summary["capital_base"]))
 
 
 def _render_history_chart(history_df):
@@ -135,9 +136,11 @@ def _render_history_chart(history_df):
 
 def _current_prices_from_ctx(ctx):
     prices = {}
-    for symbol, status in ctx["statuses"].items():
-        if status.get("is_ready"):
-            prices[symbol] = status.get("close")
+    for symbol, frame in ctx.get("raw_data", {}).items():
+        if frame is not None and not frame.empty and "close" in frame:
+            value = frame["close"].iloc[-1]
+            if pd.notna(value) and math.isfinite(float(value)) and float(value) > 0:
+                prices[symbol] = float(value)
     return prices
 
 
@@ -146,17 +149,18 @@ def _default_trade_price(ctx, symbol, trade_date):
     if lookup["price"] is not None:
         return round(lookup["price"], 3), lookup
 
-    status_price = ctx["statuses"].get(symbol, {}).get("close")
-    if status_price:
-        lookup["message"] = "未找到所选日期行情，临时使用最新价，请手动确认成交价"
+    status_price = _current_prices_from_ctx(ctx).get(symbol)
+    if status_price is not None:
+        lookup["message"] = "未找到所选日期行情，临时使用最新参考收盘价，实际成交价请核对"
         return round(float(status_price), 3), lookup
-    return 1.0, lookup
+    lookup["message"] = "暂无有效行情，请按交割单填写实际成交价"
+    return None, lookup
 
 
 def _render_record_form(ctx, records):
     """Render the add-record form and persist submitted data."""
-    with st.container(border=True):
-        st.markdown("#### 新增买入/卖出")
+    with st.container(border=False):
+        st.caption("按交割单填写实际成交信息。")
         c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.1, 1.2])
         trade_date = c1.date_input("日期", value=pd.Timestamp.today(), key="investment_trade_date")
         symbol = c2.selectbox(
@@ -170,7 +174,8 @@ def _render_record_form(ctx, records):
 
         c5, c6, c7 = st.columns([1.1, 1.1, 2.2])
         default_price, price_lookup = _default_trade_price(ctx, symbol, trade_date)
-        price_key = f"investment_price_{symbol}_{pd.Timestamp(trade_date).strftime('%Y%m%d')}"
+        price_basis = ctx.get("price_basis", "前复权")
+        price_key = f"investment_price_{ctx.get('provider', 'akshare')}_{symbol}_{pd.Timestamp(trade_date).strftime('%Y%m%d')}"
         price = c5.number_input(
             "成交价",
             min_value=0.001,
@@ -178,21 +183,22 @@ def _render_record_form(ctx, records):
             step=0.001,
             format="%.3f",
             key=price_key,
-            help="默认带出所选 ETF 在所选日期的收盘价；实际成交价不同可直接手工修改。",
+            help=f"默认带出所选 ETF 在所选日期的参考收盘价（{price_basis}）；请按交割单核对实际成交价。",
+            placeholder="填写实际成交价",
         )
         fee = c6.number_input("佣金/费用", min_value=0.0, value=0.0, step=0.01, format="%.2f", key="investment_fee")
         note = c7.text_input("备注", placeholder="可选", key="investment_note")
 
         if price_lookup["price"] is not None:
             lookup_date = _date(price_lookup["date"])
-            c5.caption(f"{price_lookup['message']}: {lookup_date} 收盘价 {price_lookup['price']:.3f}")
+            st.caption(f"{price_lookup['message']}: {lookup_date} 参考收盘价 {price_lookup['price']:.3f}（{price_basis}），实际成交价请核对。")
         else:
-            c5.caption(price_lookup["message"])
+            st.caption(price_lookup["message"])
 
-        submitted = st.button("保存记录", type="primary", key="investment_save_record")
+        submitted = st.button("保存记录", type="primary", key="investment_save_record", disabled=side_label not in SIDE_VALUES or price is None)
         if submitted:
             try:
-                records = append_record(
+                updated_records = append_record(
                     records,
                     date=trade_date,
                     symbol=symbol,
@@ -202,22 +208,23 @@ def _render_record_form(ctx, records):
                     fee=fee,
                     note=note,
                 )
-                save_records(records)
+                save_records(updated_records)
                 st.success("投资记录已保存。")
                 st.rerun()
-            except ValueError as exc:
-                st.error(str(exc))
+            except (ValueError, OSError) as exc:
+                st.error(f"投资记录未保存：{exc}")
     return records
 
 
 def _render_raw_records(records, analysis):
     """Render raw record management."""
-    with st.expander("原始流水与删除", expanded=False):
+    with st.container(border=False):
+        st.caption("导出全部流水，或选择需要移除的记录。")
         record_display = _format_records(analysis["records"])
         if record_display.empty:
             st.info("暂无投资记录。")
         else:
-            st.dataframe(record_display.sort_values("日期", ascending=False), width="stretch", hide_index=True)
+            st.dataframe(record_display.drop(columns=["记录ID"]).sort_values("日期", ascending=False), width="stretch", hide_index=True)
             labels = {
                 row["记录ID"]: f"{row['日期']} {row['ETF']} {row['方向']} {row['份额']}份 @ {row['成交价']}"
                 for _, row in record_display.iterrows()
@@ -229,11 +236,19 @@ def _render_raw_records(records, analysis):
                 key="investment_delete_ids",
             )
             if st.button("删除选中记录", type="secondary", disabled=not selected_ids, key="investment_delete_records"):
-                save_records(delete_records(records, selected_ids))
-                st.success("已删除选中记录。")
-                st.rerun()
+                try:
+                    save_records(delete_records(records, selected_ids))
+                    st.success("已删除选中记录。")
+                    st.rerun()
+                except (ValueError, OSError) as exc:
+                    st.error(f"记录未删除：{exc}")
 
-            csv = record_display.to_csv(index=False).encode("utf-8-sig")
+            export_display = record_display.copy()
+            # Treat a note as text when opened in spreadsheet software.
+            export_display["备注"] = export_display["备注"].map(
+                lambda value: "'" + value if value.lstrip().startswith(("=", "+", "-", "@")) else value
+            )
+            csv = export_display.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 "导出投资流水",
                 csv,
@@ -243,81 +258,57 @@ def _render_raw_records(records, analysis):
             )
 
 
-def render(ctx, show_title=True, compact=False):
-    """Render investment records and calculated return history."""
+def render(ctx, show_title=True, compact=False, records=None, analysis=None, show_summary=True):
+    """A separate portfolio workspace with an explicit record-entry action."""
     if show_title:
-        st.markdown("### 投资记录")
-    st.caption(f"记录保存在本机 `{RECORDS_PATH}`，该文件已被忽略，不会上传到公开仓库。")
-
-    records = load_records()
-    analysis = calculate_investment_summary(records, _current_prices_from_ctx(ctx))
-
-    if compact:
-        _render_summary(analysis["summary"])
-
-        if not analysis["unmatched_sells"].empty:
-            st.warning("存在卖出份额超过已记录持仓的记录，相关部分未计入收益。请检查交易流水。")
-
-        st.markdown("#### 当前持仓")
-        open_display = _format_open_positions(analysis["open_positions"])
-        if open_display.empty:
-            st.info("暂无未卖出的持仓。")
-        else:
-            st.dataframe(open_display, width="stretch", hide_index=True)
-
-        with st.expander("新增买入/卖出", expanded=False):
-            _render_record_form(ctx, records)
-
-        with st.expander("历史收益", expanded=False):
-            _render_history_chart(analysis["history"])
-            history_display = _format_history(analysis["history"])
-            if history_display.empty:
-                st.info("暂无已实现收益，卖出记录会在这里形成历史收益。")
-            else:
-                st.dataframe(history_display.sort_values("月份", ascending=False), width="stretch", hide_index=True)
-
-        with st.expander("已实现交易明细", expanded=False):
-            closed_display = _format_closed_trades(analysis["closed_trades"])
-            if closed_display.empty:
-                st.info("暂无已配对的卖出交易。")
-            else:
-                st.dataframe(closed_display.sort_values("卖出日期", ascending=False), width="stretch", hide_index=True)
-
-        _render_raw_records(records, analysis)
+        st.markdown("### 持仓记录")
+    try:
+        if records is None:
+            records = load_records()
+        if analysis is None:
+            analysis = calculate_investment_summary(records, _current_prices_from_ctx(ctx))
+    except (ValueError, OSError) as exc:
+        st.error(f"无法读取投资记录：{exc}")
         return
 
-    records = _render_record_form(ctx, records)
-    analysis = calculate_investment_summary(records, _current_prices_from_ctx(ctx))
+    summary = analysis["summary"]
+    dates = [frame.index.max() for frame in ctx["raw_data"].values() if not frame.empty]
+    valuation_date = min(dates).strftime("%Y.%m.%d") if dates else "暂无行情"
+    st.caption(f"仅保存在本机 · 估值数据截至 {valuation_date} · {ctx.get('price_basis', '前复权')}")
+    if summary.get("missing_price_symbols"):
+        st.warning(f"{'、'.join(summary['missing_price_symbols'])} 缺少有效行情，当前市值、浮动收益和累计收益暂不计算；已实现收益仍可查看。")
+    if records.empty:
+        st.markdown('<div class="empty-state"><strong>从第一笔交易开始</strong><p>添加实际买入或卖出记录，即可查看持仓、市值和收益。</p></div>', unsafe_allow_html=True)
+    elif show_summary:
+        _render_summary(summary)
 
-    st.markdown("---")
-    _render_summary(analysis["summary"])
+    with st.expander("新增交易记录", expanded=False):
+        _render_record_form(ctx, records)
 
+    if records.empty:
+        return
     if not analysis["unmatched_sells"].empty:
         st.warning("存在卖出份额超过已记录持仓的记录，相关部分未计入收益。请检查交易流水。")
-        warn_df = analysis["unmatched_sells"].copy()
-        warn_df["date"] = warn_df["date"].dt.strftime("%Y-%m-%d")
-        st.dataframe(warn_df, width="stretch", hide_index=True)
-
-    st.markdown("#### 当前持仓")
-    open_display = _format_open_positions(analysis["open_positions"])
-    if open_display.empty:
-        st.info("暂无未卖出的持仓。")
-    else:
-        st.dataframe(open_display, width="stretch", hide_index=True)
-
-    st.markdown("#### 历史收益")
-    _render_history_chart(analysis["history"])
-    history_display = _format_history(analysis["history"])
-    if history_display.empty:
-        st.info("暂无已实现收益，卖出记录会在这里形成历史收益。")
-    else:
-        st.dataframe(history_display.sort_values("月份", ascending=False), width="stretch", hide_index=True)
-
-    with st.expander("已实现交易明细", expanded=False):
-        closed_display = _format_closed_trades(analysis["closed_trades"])
-        if closed_display.empty:
-            st.info("暂无已配对的卖出交易。")
+    view = st.segmented_control("记录视图", ["当前持仓", "收益记录", "交易流水"],
+                                default="当前持仓", key="investment_view") or "当前持仓"
+    if view == "当前持仓":
+        display = _format_open_positions(analysis["open_positions"])
+        if display.empty:
+            st.info("当前没有未卖出的持仓，可在收益记录中查看已完成交易。")
         else:
-            st.dataframe(closed_display.sort_values("卖出日期", ascending=False), width="stretch", hide_index=True)
-
-    _render_raw_records(records, analysis)
+            st.dataframe(display, width="stretch", hide_index=True)
+    elif view == "收益记录":
+        _render_history_chart(analysis["history"])
+        history = _format_history(analysis["history"])
+        if history.empty:
+            st.info("卖出交易完成配对后，将在这里显示已实现收益。")
+        else:
+            st.dataframe(history.sort_values("月份", ascending=False), width="stretch", hide_index=True)
+        with st.expander("已实现交易明细"):
+            closed = _format_closed_trades(analysis["closed_trades"])
+            if not closed.empty:
+                st.dataframe(closed.sort_values("卖出日期", ascending=False), width="stretch", hide_index=True)
+            else:
+                st.caption("暂无已配对的卖出交易。")
+    else:
+        _render_raw_records(records, analysis)

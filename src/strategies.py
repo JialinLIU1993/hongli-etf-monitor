@@ -46,133 +46,53 @@ class BollingerBandsStrategy(BaseStrategy):
 
     def generate_signals(self, df):
         signals = df.copy()
-        signals['ma'] = df['close'].rolling(window=self.window).mean()
-        signals['std'] = df['close'].rolling(window=self.window).std()
-        signals['upper_band'] = signals['ma'] + (signals['std'] * self.num_std)
-        signals['lower_band'] = signals['ma'] - (signals['std'] * self.num_std)
-        
-        signals['signal'] = 0.0
-        signals['position'] = 0.0
-        
-        # Initialize with min_position instead of 0.0?
-        # Typically we start empty, but strategy logic will force it up if min_position > 0 
-        # But here we only update on conditions.
-        # So we should init current_position to min_position to ensure we hold it from start?
-        # Or wait for first signal?
-        # "Investment during idle period" implies holding it when no other signal is present.
-        # So we should default to min_position.
-        current_position = self.min_position
-        position_list = []
-        
-        # Need previous values for Reversal Mode
-        prev_close = signals['close'].shift(1)
-        prev_lower = signals['lower_band'].shift(1)
-        prev_upper = signals['upper_band'].shift(1)
-        
-        for index, row in signals.iterrows():
-            # ... (omitted comments) ...
-            
-            if self.staged:
-                # 金字塔加仓逻辑（优先）
-                if self.pyramid_levels and row['close'] < row['lower_band']:
-                    depth = (row['lower_band'] - row['close']) / row['lower_band']
-                    cumulative = self.min_position
-                    for lvl, sz in zip(self.pyramid_levels, self.pyramid_sizes):
-                        if depth >= lvl:
-                            cumulative += sz
-                    current_position = max(current_position, min(cumulative, 1.0))
+        rolling = df['close'].rolling(window=self.window)
+        signals['ma'] = rolling.mean()
+        signals['std'] = rolling.std()
+        signals['upper_band'] = signals['ma'] + signals['std'] * self.num_std
+        signals['lower_band'] = signals['ma'] - signals['std'] * self.num_std
 
-                # 原有分批逻辑（无金字塔时用）
-                elif row['close'] < row['lower_band'] * (1 - self.scale_threshold): # Deep dip
-                    current_position = 1.0
-                elif row['close'] < row['lower_band']: # Mild dip
-                    target = max(self.first_batch_pct, self.min_position)
-                    current_position = max(current_position, target)
-                
-                # Staged Selling
-                elif row['close'] > row['upper_band'] * (1 + self.scale_threshold): # High spike
-                    current_position = self.min_position # Clear to min
-                elif row['close'] > row['upper_band']: # Mild spike
-                    # Sell First Batch (Keep remaining)
-                    # We want to reduce exposure, but not below min_position.
-                    # Standard logic: min(current, 1.0 - sell_batch_pct)
-                    # With min_pos: max(1.0 - sell_batch_pct, min_pos)
-                    
-                    sell_target = max(1.0 - self.sell_batch_pct, self.min_position)
-                    current_position = min(current_position, sell_target)
-            
-            else:
-                # All-in Logic (with min_position support)
-                if self.confirm_reversal:
-                    # ... (Reversal logic not fully adapted for min_position in loop, skipping for now as we use Staged) ...
-                    pass 
-                else:
-                    # Standard Mode
-                    if row['close'] < row['lower_band']:
-                        current_position = 1.0 # Buy All
-                    elif row['close'] > row['upper_band']:
-                        current_position = self.min_position # Sell All (to min)
-            
-            # Ensure we never go below min_position (unless explicitly desired, but here we enforce it)
-            current_position = max(current_position, self.min_position)
-            
-            position_list.append(current_position)
-        
-        # Post-loop processing for Reversal if enabled
         if self.confirm_reversal and not self.staged:
-            # Re-calculate using vectorized crossover logic for Reversal Mode
-            # This overrides the loop above for the All-in case
-            
-            # 1. Identify Cross Over Lower (Buy)
-            # Condition: Prev Close < Prev Lower AND Curr Close > Curr Lower
-            cross_over_lower = (signals['close'].shift(1) < signals['lower_band'].shift(1)) & \
-                               (signals['close'] > signals['lower_band'])
-            
-            # 2. Identify Cross Under Upper (Sell)
-            # Condition: Prev Close > Prev Upper AND Curr Close < Curr Upper
-            cross_under_upper = (signals['close'].shift(1) > signals['upper_band'].shift(1)) & \
-                                (signals['close'] < signals['upper_band'])
-            
-            # 3. Construct Position
-            # We need to fill forward.
-            # Signal 1 on Buy, -1 on Sell.
-            
-            # Create a signal series
-            sig = pd.Series(0, index=signals.index)
-            sig[cross_over_lower] = 1
-            sig[cross_under_upper] = -1
-            
-            # If no signal, carry forward position?
-            # We want: 0 -> 1 (Buy) -> 1 (Hold) -> 0 (Sell) -> 0 (Wait)
-            # Replace 0 with NaN then ffill?
-            # But we start at 0.
-            
-            # We need to map -1 to 0 for position.
-            # 1 = Enter Long
-            # -1 = Exit Long
-            
-            # Let's use a cumulative logic or loop again.
-            pos = 0.0
-            new_positions = []
-            for s in sig:
-                if s == 1:
-                    pos = 1.0
-                elif s == -1:
-                    pos = 0.0
-                new_positions.append(pos)
-            
-            signals['position'] = new_positions
-
-        elif self.staged:
-             # Staged Reversal is too complex for this quick fix (multiple batches).
-             # We ignore confirm_reversal for Staged mode or treat it same as standard for now.
-             signals['position'] = position_list
-
+            # An all-in reversal enters/exits after crossing back inside the bands.
+            buy = (df['close'].shift(1) < signals['lower_band'].shift(1)) & (df['close'] > signals['lower_band'])
+            sell = (df['close'].shift(1) > signals['upper_band'].shift(1)) & (df['close'] < signals['upper_band'])
+            targets = pd.Series(np.nan, index=signals.index, dtype=float)
+            targets.loc[buy] = 1.0
+            targets.loc[sell] = self.min_position
+            signals['position'] = targets.ffill().fillna(self.min_position)
         else:
-             signals['position'] = position_list
+            current_position = self.min_position
+            positions = np.empty(len(signals), dtype=float)
+            # Iterate numeric arrays; iterrows creates a Series for every trading day.
+            values = zip(signals['close'].to_numpy(), signals['lower_band'].to_numpy(),
+                         signals['upper_band'].to_numpy())
+            for i, (close, lower, upper) in enumerate(values):
+                if self.staged:
+                    # Keep existing staged behavior, including pyramid priority.
+                    if self.pyramid_levels and close < lower:
+                        depth = (lower - close) / lower
+                        cumulative = self.min_position + sum(
+                            size for level, size in zip(self.pyramid_levels, self.pyramid_sizes)
+                            if depth >= level
+                        )
+                        current_position = max(current_position, min(cumulative, 1.0))
+                    elif close < lower * (1 - self.scale_threshold):
+                        current_position = 1.0
+                    elif close < lower:
+                        current_position = max(current_position, self.first_batch_pct, self.min_position)
+                    elif close > upper * (1 + self.scale_threshold):
+                        current_position = self.min_position
+                    elif close > upper:
+                        current_position = min(current_position, max(1.0 - self.sell_batch_pct, self.min_position))
+                elif close < lower:
+                    current_position = 1.0
+                elif close > upper:
+                    current_position = self.min_position
+                positions[i] = max(current_position, self.min_position)
+            signals['position'] = positions
 
-        signals['signal'] = signals['position'].diff()
-        
+        # The account starts in cash, so an initial minimum position is a buy.
+        signals['signal'] = signals['position'].diff().fillna(signals['position'])
         return signals
 
 class RSIStrategy(BaseStrategy):
@@ -201,34 +121,34 @@ class RSIStrategy(BaseStrategy):
         current_position = 0.0
         position_list = []
         
-        for index, row in signals.iterrows():
+        for row in signals.itertuples(index=False):
             if self.staged:
                 # Staged Buying (Pyramiding)
-                if row['rsi'] < (self.buy_threshold - 5): # e.g. < 25
+                if row.rsi < (self.buy_threshold - 5): # e.g. < 25
                     current_position = 1.0 # 100%
-                elif row['rsi'] < self.buy_threshold: # e.g. < 30
+                elif row.rsi < self.buy_threshold: # e.g. < 30
                     current_position = max(current_position, 0.6) # At least 60%
-                elif row['rsi'] < (self.buy_threshold + 5): # e.g. < 35
+                elif row.rsi < (self.buy_threshold + 5): # e.g. < 35
                     current_position = max(current_position, 0.3) # At least 30%
                 
                 # Staged Selling
-                elif row['rsi'] > (self.sell_threshold + 5): # e.g. > 75
+                elif row.rsi > (self.sell_threshold + 5): # e.g. > 75
                     current_position = 0.0 # Clear
-                elif row['rsi'] > self.sell_threshold: # e.g. > 70
+                elif row.rsi > self.sell_threshold: # e.g. > 70
                     current_position = min(current_position, 0.3) # Max 30%
-                elif row['rsi'] > (self.sell_threshold - 5): # e.g. > 65
+                elif row.rsi > (self.sell_threshold - 5): # e.g. > 65
                     current_position = min(current_position, 0.6) # Max 60%
             else:
                 # All-in/All-out Logic
-                if row['rsi'] < self.buy_threshold:
+                if row.rsi < self.buy_threshold:
                     current_position = 1.0 # Buy All
-                elif row['rsi'] > self.sell_threshold:
+                elif row.rsi > self.sell_threshold:
                     current_position = 0.0 # Sell All
                 
             position_list.append(current_position)
             
         signals['position'] = position_list
-        signals['signal'] = signals['position'].diff()
+        signals['signal'] = signals['position'].diff().fillna(signals['position'])
         return signals
 
 class BollingerWithInnerBandStrategy(BaseStrategy):
@@ -276,34 +196,34 @@ class BollingerWithInnerBandStrategy(BaseStrategy):
         # 'PARTIAL': Main position held but reduced by inner swing (1.0 - inner_ratio)
         state = 'EMPTY' 
         
-        for index, row in signals.iterrows():
-            if pd.isna(row['upper_main']) or pd.isna(row['upper_inner']):
+        for row in signals.itertuples(index=False):
+            if pd.isna(row.upper_main) or pd.isna(row.upper_inner):
                 position_list.append(current_position)
                 continue
             
             # 1. Main Logic Triggers (Priority)
             
             # Main Buy Signal: Close < Lower Main
-            if row['close'] < row['lower_main']:
+            if row.close < row.lower_main:
                 current_position = 1.0
                 state = 'FULL'
             
             # Main Sell Signal: Close > Upper Main
-            elif row['close'] > row['upper_main']:
+            elif row.close > row.upper_main:
                 current_position = 0.0
                 state = 'EMPTY'
             
             # 2. Inner Swing Logic (Only if holding Main Position)
             elif state == 'FULL':
                 # We are holding full position. Look for opportunity to sell high (Inner Swing).
-                if row['close'] > row['upper_inner']:
+                if row.close > row.upper_inner:
                     # Sell inner_ratio
                     current_position = 1.0 - self.inner_ratio
                     state = 'PARTIAL'
             
             elif state == 'PARTIAL':
                 # We sold some. Look to buy back low.
-                if row['close'] < row['lower_inner']:
+                if row.close < row.lower_inner:
                     # Buy back
                     current_position = 1.0
                     state = 'FULL'
@@ -313,7 +233,7 @@ class BollingerWithInnerBandStrategy(BaseStrategy):
             position_list.append(current_position)
             
         signals['position'] = position_list
-        signals['signal'] = signals['position'].diff()
+        signals['signal'] = signals['position'].diff().fillna(signals['position'])
         
         return signals
 
@@ -350,20 +270,20 @@ class BollingerWithGridStrategy(BaseStrategy):
         grids_sold = 0
         holding_main = False
         
-        for index, row in signals.iterrows():
-            if pd.isna(row['upper_band']):
+        for row in signals.itertuples(index=False):
+            if pd.isna(row.upper_band):
                 position_list.append(current_position)
                 continue
                 
             # Main Strategy
-            if row['close'] < row['lower_band']:
+            if row.close < row.lower_band:
                 # Buy Signal (Entry)
                 current_position = 1.0
                 holding_main = True
-                last_grid_price = row['close']
+                last_grid_price = row.close
                 grids_sold = 0
             
-            elif row['close'] > row['upper_band']:
+            elif row.close > row.upper_band:
                 # Sell Signal (Exit)
                 current_position = 0.0
                 holding_main = False
@@ -374,21 +294,21 @@ class BollingerWithGridStrategy(BaseStrategy):
             elif holding_main:
                 # Check for Grid Sell (Price Rises)
                 # If price > last * (1 + step)
-                if row['close'] > last_grid_price * (1 + self.grid_step):
+                if row.close > last_grid_price * (1 + self.grid_step):
                     if grids_sold < self.max_grids:
                         # Sell one grid unit
                         current_position -= self.grid_qty
                         grids_sold += 1
-                        last_grid_price = row['close'] # Update reference price
+                        last_grid_price = row.close # Update reference price
                 
                 # Check for Grid Buy Back (Price Falls)
                 # If price < last * (1 - step)
-                elif row['close'] < last_grid_price * (1 - self.grid_step):
+                elif row.close < last_grid_price * (1 - self.grid_step):
                     if grids_sold > 0:
                         # Buy back one grid unit
                         current_position += self.grid_qty
                         grids_sold -= 1
-                        last_grid_price = row['close'] # Update reference price
+                        last_grid_price = row.close # Update reference price
             
             # Ensure bounds and precision
             current_position = max(0.0, min(1.0, current_position))
@@ -396,7 +316,7 @@ class BollingerWithGridStrategy(BaseStrategy):
             position_list.append(current_position)
             
         signals['position'] = position_list
-        signals['signal'] = signals['position'].diff()
+        signals['signal'] = signals['position'].diff().fillna(signals['position'])
         
         return signals
 
@@ -416,15 +336,15 @@ class MA40GradualStrategy(BaseStrategy):
         current_position = 0.0
         position_list = []
         
-        for index, row in signals.iterrows():
-            if pd.isna(row['ma']):
+        for row in signals.itertuples(index=False):
+            if pd.isna(row.ma):
                 position_list.append(current_position)
                 continue
 
-            if row['close'] < row['ma']:
+            if row.close < row.ma:
                 # Buy 10%
                 current_position = min(current_position + self.step, 1.0)
-            elif row['close'] > row['ma']:
+            elif row.close > row.ma:
                 # Sell 10%
                 current_position = max(current_position - self.step, 0.0)
             
@@ -434,7 +354,7 @@ class MA40GradualStrategy(BaseStrategy):
             position_list.append(current_position)
             
         signals['position'] = position_list
-        signals['signal'] = signals['position'].diff()
+        signals['signal'] = signals['position'].diff().fillna(signals['position'])
         return signals
 
 class DualMAStrategy(BaseStrategy):
@@ -454,7 +374,7 @@ class DualMAStrategy(BaseStrategy):
         # 填充NaN
         signals['position'] = pd.Series(signals['position'], index=signals.index).fillna(0.0)
         
-        signals['signal'] = signals['position'].diff().fillna(0.0)
+        signals['signal'] = signals['position'].diff().fillna(signals['position'])
         return signals
 
 class CombinedStrategy(BaseStrategy):
@@ -490,7 +410,7 @@ class CombinedStrategy(BaseStrategy):
         signals['position'] = (pos_main * self.main_weight + pos_sub * self.sub_weight)
         
         # 重新计算最终合并信号（仓位变化）
-        signals['signal'] = signals['position'].diff().fillna(0.0)
+        signals['signal'] = signals['position'].diff().fillna(signals['position'])
         
         # 附加副策略的调试字段（可选，这里加上前缀防止冲突）
         signals['sub_position'] = pos_sub
@@ -522,20 +442,20 @@ class DividendPremiumStrategy(BaseStrategy):
         current_position = 0.0
         position_list = []
         
-        for index, row in signals.iterrows():
-            if pd.isna(row['dividend_premium']):
+        for row in signals.itertuples(index=False):
+            if pd.isna(row.dividend_premium):
                 position_list.append(current_position)
                 continue
                 
-            if row['dividend_premium'] > self.buy_threshold:
+            if row.dividend_premium > self.buy_threshold:
                 current_position = 1.0
-            elif row['dividend_premium'] < self.sell_threshold:
+            elif row.dividend_premium < self.sell_threshold:
                 current_position = 0.0
                 
             position_list.append(current_position)
             
         signals['position'] = position_list
-        signals['signal'] = signals['position'].diff().fillna(0.0)
+        signals['signal'] = signals['position'].diff().fillna(signals['position'])
         
         return signals
 

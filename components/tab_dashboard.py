@@ -1,66 +1,62 @@
-"""Core monitoring dashboard."""
+"""Instrument-centered market workspace: quote, chart, then decision context."""
+from html import escape
 import pandas as pd
 import streamlit as st
-
-from components import tab_investments, tab_kline
-from src.investment_records import calculate_investment_summary, load_records
+from components import tab_kline
 
 
-def _date(value):
-    if value is None:
-        return "暂无"
-    return value.strftime("%Y-%m-%d") if hasattr(value, "strftime") else str(value)
+def _instrument_header(ctx, symbol):
+    profile = ctx["profiles"][symbol]
+    status = ctx["statuses"][symbol]
+    raw = ctx["raw_data"][symbol]
+    quote = ctx.get("quotes", {}).get(symbol)
+    price = quote["price"] if quote else (raw["close"].iloc[-1] if not raw.empty else None)
+    price_text = f"{price:.3f}" if price is not None else "—"
+    latest = ctx["data_status"][symbol]["last_date"]
+    latest_text = latest.strftime("%Y.%m.%d") if latest is not None else "暂无行情"
+    target = f"{status['target_position']:.0%}" if status.get("is_ready") else "—"
+    label = status.get("state_label", "等待行情")
+    price_label = "行情快照" if quote else "日线收盘"
+    st.markdown(
+        f'<section class="instrument-head"><div class="instrument-name"><div class="eyebrow">{symbol} · 场内 ETF</div><h1>{escape(profile.name)}</h1><p>日线截至 {latest_text}</p></div>'
+        f'<div class="instrument-price">{price_text}<small>{price_label} / 元</small></div>'
+        f'<div class="instrument-state"><span class="eyebrow">通道状态</span><strong>{escape(label)}</strong></div>'
+        f'<div class="instrument-target"><span class="eyebrow">日线目标仓位</span><strong>{target}</strong></div></section>',
+        unsafe_allow_html=True,
+    )
+    if quote:
+        timestamp = quote.get("quote_time")
+        time_label = timestamp.strftime("%Y-%m-%d %H:%M:%S") if timestamp else "接口未提供时间"
+        st.caption(f"快照时间：{time_label}；图表与策略使用日线。")
+    if latest is not None and (pd.Timestamp(ctx["end_date"]) - latest).days > 7:
+        st.warning(f"行情停留在 {latest:%Y-%m-%d}，距所选结束日期超过 7 天，请检查数据更新。")
 
 
-def _money(value):
-    if value is None or pd.isna(value):
-        return "—"
-    return f"{value:,.2f}"
-
-
-def _pct(value):
-    if value is None or pd.isna(value):
-        return "—"
-    return f"{value:.2%}"
-
-
-def _current_prices(ctx):
-    prices = {}
-    for symbol, status in ctx["statuses"].items():
-        if status.get("is_ready"):
-            prices[symbol] = status.get("close")
-    return prices
-
-
-def _data_latest(ctx):
-    latest_dates = [
-        data["last_date"]
-        for data in ctx["data_status"].values()
-        if data["last_date"] is not None
-    ]
-    return min(latest_dates) if latest_dates else None
+def _decision_context(view):
+    status = view["status"]
+    if not status.get("is_ready"):
+        st.info(status.get("message", "行情不足，暂时无法计算策略。"))
+        return
+    last = status.get("last_signal", {})
+    recent = f"{last['date']:%Y.%m.%d}" if last.get("date") is not None else "暂无调仓"
+    action = escape(last.get("action", "暂无"))
+    position = f"调仓后目标仓位 {last['position_after']:.0%}" if last.get("position_after") is not None else "当前区间尚未出现调仓信号。"
+    st.markdown(
+        f'<div class="analysis-heading"><h2>决策参考</h2><span>按图表末日 {view["last_date"]:%Y.%m.%d} 计算</span></div>'
+        f'<div class="decision-grid"><section><div class="eyebrow">01 / 当前位置</div><h3>{escape(status["state_label"])}</h3><p>{escape(status["hint"])}</p><div class="decision-foot">通道位置 <strong>{status["channel_position"]:.0%}</strong></div></section>'
+        f'<section><div class="eyebrow">02 / 价格边界</div><div class="band-values"><div><small>下轨</small><strong>{status["lower_band"]:.3f}</strong></div><div><small>中轨</small><strong>{status["ma"]:.3f}</strong></div><div><small>上轨</small><strong>{status["upper_band"]:.3f}</strong></div></div><p>与当日收盘价比较，观察买入与卖出边界。</p></section>'
+        f'<section><div class="eyebrow">03 / 最近调仓</div><h3>{recent} <span>{action}</span></h3><p>{position}</p><div class="decision-foot">策略信号，请结合实际持仓判断。</div></section></div>',
+        unsafe_allow_html=True,
+    )
 
 
 def render(ctx):
-    """Render one dashboard combining monitor, K-line and investments."""
-    records = load_records()
-    investment = calculate_investment_summary(records, _current_prices(ctx))
-    summary = investment["summary"]
-    common_latest = _data_latest(ctx)
-
-    st.markdown("### Dashboard")
-    st.caption("盯盘信息已整合进 K 线图；参数优化和信号流水收在策略工具里。")
-
-    top = st.columns([1.15, 1, 1, 1, 1])
-    top[0].metric("数据截至", _date(common_latest))
-    top[1].metric("累计收益", _money(summary["total_pnl"]), _pct(summary["total_return"]), delta_color="inverse")
-    top[2].metric("浮动收益", _money(summary["unrealized_pnl"]))
-    top[3].metric("当前市值", _money(summary["market_value"]))
-    top[4].metric("记录笔数", f"{summary['record_count']}")
-
-    left, right = st.columns([1.35, 1.0], gap="large")
-    with left:
-        tab_kline.render(ctx, title="K线窗口", compact=True)
-    with right:
-        st.markdown("### 持仓与记录")
-        tab_investments.render(ctx, show_title=False, compact=True)
+    with st.container(key="instrument-switcher"):
+        symbol = st.radio("选择 ETF", list(ctx["profiles"]),
+                          format_func=lambda s: f"{ctx['profiles'][s].name}  /  {s}",
+                          horizontal=True, key="chart_etf", label_visibility="collapsed")
+    _instrument_header(ctx, symbol)
+    with st.container(key="market-canvas"):
+        view = tab_kline.render(ctx, symbol=symbol, title=None, compact=True)
+    if view:
+        _decision_context(view)

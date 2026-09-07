@@ -1,15 +1,29 @@
 """Local investment record storage and PnL calculations."""
 from __future__ import annotations
 
+from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
+from hashlib import sha256
+from io import BytesIO
+import math
+import os
 from pathlib import Path
-from uuid import uuid4
+import tempfile
+from threading import RLock
+from uuid import NAMESPACE_URL, uuid4, uuid5
+
+try:
+    import fcntl
+except ImportError:  # Windows still shares the in-process Streamlit lock.
+    fcntl = None
 
 import pandas as pd
 
 
 RECORD_COLUMNS = ["id", "date", "symbol", "side", "price", "quantity", "fee", "note", "created_at"]
-RECORDS_PATH = Path("data/investment_records.csv")
+RECORDS_PATH = Path(__file__).resolve().parents[1] / "data" / "investment_records.csv"
+_RECORD_LOCK = RLock()
 
 
 @dataclass(frozen=True)
@@ -24,32 +38,65 @@ def empty_records() -> pd.DataFrame:
 
 
 def normalize_records(records: pd.DataFrame) -> pd.DataFrame:
-    """Normalize types and ordering for records loaded from CSV or UI edits."""
+    """Normalize records without silently dropping or repairing invalid trades."""
     if records is None or records.empty:
-        return empty_records()
+        result = empty_records()
+        if records is not None:
+            result.attrs.update(records.attrs)
+        return result
 
     normalized = records.copy()
+    required = {"date", "symbol", "side", "price", "quantity"}
+    missing = required - set(normalized.columns)
+    if missing:
+        raise ValueError(f"投资记录缺少必要字段：{', '.join(sorted(missing))}。原文件未修改。")
     for col in RECORD_COLUMNS:
         if col not in normalized.columns:
-            normalized[col] = ""
+            normalized[col] = 0.0 if col == "fee" else ""
 
-    normalized = normalized[RECORD_COLUMNS]
-    normalized["date"] = pd.to_datetime(normalized["date"], errors="coerce")
-    normalized["created_at"] = pd.to_datetime(normalized["created_at"], errors="coerce")
-    normalized["symbol"] = normalized["symbol"].astype(str)
-    normalized["side"] = normalized["side"].astype(str)
-    normalized["price"] = pd.to_numeric(normalized["price"], errors="coerce").fillna(0.0)
-    normalized["quantity"] = pd.to_numeric(normalized["quantity"], errors="coerce").fillna(0.0)
-    normalized["fee"] = pd.to_numeric(normalized["fee"], errors="coerce").fillna(0.0)
+    # Keep any additional CSV columns so that saving cannot discard user data.
+    extra_columns = [col for col in normalized.columns if col not in RECORD_COLUMNS]
+    normalized = normalized[RECORD_COLUMNS + extra_columns]
+    created_at_present = normalized["created_at"].notna() & normalized["created_at"].astype(str).str.strip().ne("")
+    normalized["date"] = pd.to_datetime(normalized["date"], errors="coerce", format="mixed")
+    normalized["created_at"] = pd.to_datetime(normalized["created_at"], errors="coerce", format="mixed")
+    for col in ("date", "created_at"):
+        if isinstance(normalized[col].dtype, pd.DatetimeTZDtype):
+            normalized[col] = normalized[col].dt.tz_localize(None)
+        elif not pd.api.types.is_datetime64_any_dtype(normalized[col]):
+            raise ValueError("投资记录的日期时区格式不一致，请检查原文件。")
+    normalized["date"] = normalized["date"].dt.normalize()
+    normalized["symbol"] = normalized["symbol"].fillna("").astype(str).str.strip()
+    normalized["side"] = normalized["side"].fillna("").astype(str).str.strip()
+    for col in ("price", "quantity", "fee"):
+        normalized[col] = pd.to_numeric(normalized[col], errors="coerce")
     normalized["note"] = normalized["note"].fillna("").astype(str)
 
-    normalized = normalized.dropna(subset=["date"])
-    normalized = normalized[normalized["symbol"].isin(["510880", "512890"])]
-    normalized = normalized[normalized["side"].isin(["buy", "sell"])]
-    normalized = normalized[(normalized["price"] > 0) & (normalized["quantity"] > 0)]
+    valid = (
+        normalized["date"].notna()
+        & (~created_at_present | normalized["created_at"].notna())
+        & normalized["symbol"].isin(["510880", "512890"])
+        & normalized["side"].isin(["buy", "sell"])
+        & (normalized["price"] > 0)
+        & (normalized["quantity"] > 0)
+        & (normalized["fee"] >= 0)
+    )
+    for col in ("price", "quantity", "fee"):
+        valid &= normalized[col].map(math.isfinite)
+    if not valid.all():
+        rows = [str(i + 2) for i, ok in enumerate(valid) if not ok]
+        raise ValueError(f"投资记录第 {', '.join(rows[:10])} 行包含无效日期、ETF、方向或金额，请检查原文件；未丢弃任何记录。")
     normalized["created_at"] = normalized["created_at"].fillna(normalized["date"])
+    normalized["id"] = normalized["id"].fillna("").astype(str).str.strip()
+    for position in (i for i, missing_id in enumerate(normalized["id"].eq("")) if missing_id):
+        # Stable IDs keep older CSV files without IDs manageable across reruns.
+        identity = f"{position}:{normalized.iloc[position].to_json(date_format='iso')}"
+        normalized.iloc[position, normalized.columns.get_loc("id")] = uuid5(NAMESPACE_URL, identity).hex[:12]
+    if normalized["id"].duplicated().any():
+        raise ValueError("投资记录存在重复 ID，请检查原文件后再保存或删除。")
 
-    return normalized.sort_values(["date", "created_at", "id"]).reset_index(drop=True)
+    # Existing timestamps have second precision: equal timestamps retain CSV order.
+    return normalized.sort_values(["date", "created_at"], kind="stable").reset_index(drop=True)
 
 
 def validate_record(symbol: str, side: str, price: float, quantity: float, fee: float) -> RecordValidationResult:
@@ -58,6 +105,12 @@ def validate_record(symbol: str, side: str, price: float, quantity: float, fee: 
         return RecordValidationResult(False, "请选择支持的 ETF。")
     if side not in {"buy", "sell"}:
         return RecordValidationResult(False, "请选择买入或卖出。")
+    try:
+        price, quantity, fee = float(price), float(quantity), float(fee)
+    except (TypeError, ValueError, OverflowError):
+        return RecordValidationResult(False, "成交价、份额和费用必须为有效数字。")
+    if not all(math.isfinite(value) for value in (price, quantity, fee)):
+        return RecordValidationResult(False, "成交价、份额和费用必须为有限数字。")
     if price <= 0:
         return RecordValidationResult(False, "成交价必须大于 0。")
     if quantity <= 0:
@@ -93,13 +146,13 @@ def lookup_trade_price(price_frame: pd.DataFrame, date, field: str = "close") ->
     row = eligible.iloc[-1]
     used_date = eligible.index[-1]
     value = row[field]
-    if pd.isna(value):
+    if not _valid_price(value):
         return {
             "price": None,
             "date": used_date,
             "field": field,
             "is_exact": used_date.normalize() == target,
-            "message": "所选价格字段为空",
+            "message": "所选价格字段缺失或无效",
         }
 
     is_exact = used_date.normalize() == target
@@ -114,20 +167,85 @@ def lookup_trade_price(price_frame: pd.DataFrame, date, field: str = "close") ->
 
 def load_records(path: Path = RECORDS_PATH) -> pd.DataFrame:
     """Load local investment records. Missing file is treated as no records."""
-    if not path.exists():
-        return empty_records()
-    return normalize_records(pd.read_csv(path))
+    path = Path(path).resolve()
+    try:
+        payload = path.read_bytes()
+    except FileNotFoundError:
+        result = empty_records()
+        revision = None
+    else:
+        result = _decode_records(payload, path)
+        revision = sha256(payload).hexdigest()
+    result.attrs.update(_storage_path=str(path), _storage_revision=revision)
+    return result
+
+
+def _decode_records(payload: bytes, path: Path) -> pd.DataFrame:
+    """Decode and validate a snapshot, with a recovery hint on invalid files."""
+    try:
+        # IDs, notes and ETF codes must not be inferred as numeric or NA values.
+        return normalize_records(pd.read_csv(BytesIO(payload), dtype=str, keep_default_na=False))
+    except (ValueError, pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeError) as exc:
+        raise ValueError(f"投资记录文件无法读取：{exc} 请检查原文件或同目录备份 {path.name}.bak；未自动覆盖。") from exc
+
+
+@contextmanager
+def _storage_lock(path: Path):
+    """Serialize writers and protect the revision check from concurrent saves."""
+    with _RECORD_LOCK:
+        with path.with_suffix(path.suffix + ".lock").open("a+b") as lock_file:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _atomic_write(payload: bytes, path: Path) -> None:
+    """Write one complete snapshot without truncating the previous file."""
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as temp:
+            temporary_path = Path(temp.name)
+            temp.write(payload)
+            temp.flush()
+            os.fsync(temp.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def save_records(records: pd.DataFrame, path: Path = RECORDS_PATH) -> None:
-    """Persist records to CSV."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Atomically save valid records, refusing to overwrite a stale loaded copy."""
+    path = Path(path).resolve()
     normalized = normalize_records(records)
     to_save = normalized.copy()
     if not to_save.empty:
         to_save["date"] = to_save["date"].dt.strftime("%Y-%m-%d")
-        to_save["created_at"] = to_save["created_at"].dt.strftime("%Y-%m-%d %H:%M:%S")
-    to_save.to_csv(path, index=False)
+        to_save["created_at"] = to_save["created_at"].dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+    payload = to_save.to_csv(index=False).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _storage_lock(path):
+        try:
+            current_payload = path.read_bytes()
+        except FileNotFoundError:
+            current_payload = None
+        current_revision = sha256(current_payload).hexdigest() if current_payload is not None else None
+        if records.attrs.get("_storage_path") == str(path):
+            if current_revision != records.attrs.get("_storage_revision"):
+                raise ValueError("投资记录已被其他页面或程序更新，请刷新页面后重试，以免覆盖新记录。")
+        elif current_payload is not None:
+            raise ValueError("现有投资文件不能被没有来源版本的记录覆盖，请先读取最新记录再保存。")
+        if current_payload is not None:
+            _decode_records(current_payload, path)
+            # Back up a verified complete snapshot first. A backup failure aborts
+            # the save; a later primary-file failure leaves the original intact.
+            _atomic_write(current_payload, path.with_suffix(path.suffix + ".bak"))
+        _atomic_write(payload, path)
+    records.attrs.update(_storage_path=str(path), _storage_revision=sha256(payload).hexdigest())
 
 
 def append_record(
@@ -145,22 +263,29 @@ def append_record(
     validation = validate_record(symbol, side, price, quantity, fee)
     if not validation.ok:
         raise ValueError(validation.message)
+    try:
+        trade_date = pd.Timestamp(date)
+        if pd.isna(trade_date):
+            raise ValueError
+        trade_date = trade_date.tz_localize(None).normalize()
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("请选择有效的交易日期。") from exc
 
     new_record = {
         "id": uuid4().hex[:12],
-        "date": pd.Timestamp(date).normalize(),
+        "date": trade_date,
         "symbol": symbol,
         "side": side,
         "price": float(price),
         "quantity": float(quantity),
         "fee": float(fee),
         "note": note or "",
-        "created_at": pd.Timestamp.now().floor("s"),
+        "created_at": pd.Timestamp.now(),
     }
     normalized = normalize_records(records)
-    if normalized.empty:
-        return normalize_records(pd.DataFrame([new_record]))
-    return normalize_records(pd.concat([normalized, pd.DataFrame([new_record])], ignore_index=True))
+    combined = pd.DataFrame([new_record]) if normalized.empty else pd.concat([normalized, pd.DataFrame([new_record])], ignore_index=True)
+    combined.attrs.update(normalized.attrs)
+    return normalize_records(combined)
 
 
 def delete_records(records: pd.DataFrame, ids: list[str]) -> pd.DataFrame:
@@ -171,11 +296,16 @@ def delete_records(records: pd.DataFrame, ids: list[str]) -> pd.DataFrame:
     return normalized[~normalized["id"].isin(ids)].reset_index(drop=True)
 
 
+def _valid_price(value) -> bool:
+    try:
+        return math.isfinite(float(value)) and float(value) > 0
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _current_price(symbol: str, current_prices: dict[str, float]) -> float | None:
     value = current_prices.get(symbol)
-    if value is None or pd.isna(value):
-        return None
-    return float(value)
+    return float(value) if _valid_price(value) else None
 
 
 def calculate_investment_summary(
@@ -186,7 +316,7 @@ def calculate_investment_summary(
     current_prices = current_prices or {}
     normalized = normalize_records(records)
 
-    lots: dict[str, list[dict]] = {"510880": [], "512890": []}
+    lots: dict[str, deque[dict]] = {"510880": deque(), "512890": deque()}
     closed_rows = []
     unmatched_rows = []
 
@@ -209,7 +339,7 @@ def calculate_investment_summary(
 
         remaining_sell_qty = quantity
         sell_fee_remaining = fee
-        while remaining_sell_qty > 1e-9 and lots[symbol]:
+        while remaining_sell_qty > 0 and lots[symbol]:
             lot = lots[symbol][0]
             matched_qty = min(remaining_sell_qty, lot["remaining"])
             buy_fee = lot["fee_remaining"] * (matched_qty / lot["remaining"]) if lot["remaining"] else 0.0
@@ -238,10 +368,10 @@ def calculate_investment_summary(
             lot["fee_remaining"] -= buy_fee
             remaining_sell_qty -= matched_qty
             sell_fee_remaining -= sell_fee
-            if lot["remaining"] <= 1e-9:
-                lots[symbol].pop(0)
+            if lot["remaining"] <= 0:
+                lots[symbol].popleft()
 
-        if remaining_sell_qty > 1e-9:
+        if remaining_sell_qty > 0:
             unmatched_rows.append({
                 "date": row.date,
                 "symbol": symbol,
@@ -278,9 +408,10 @@ def calculate_investment_summary(
     realized_pnl = float(closed_df["pnl"].sum()) if not closed_df.empty else 0.0
     realized_cost = float(closed_df["cost"].sum()) if not closed_df.empty else 0.0
     open_cost = float(open_df["cost_basis"].sum()) if not open_df.empty else 0.0
-    market_value = float(open_df["market_value"].dropna().sum()) if not open_df.empty else 0.0
-    unrealized_pnl = float(open_df["unrealized_pnl"].dropna().sum()) if not open_df.empty else 0.0
-    total_pnl = realized_pnl + unrealized_pnl
+    missing_price_symbols = sorted(open_df.loc[open_df["current_price"].isna(), "symbol"].unique()) if not open_df.empty else []
+    market_value = (float(open_df["market_value"].sum()) if not open_df.empty else 0.0) if not missing_price_symbols else None
+    unrealized_pnl = (float(open_df["unrealized_pnl"].sum()) if not open_df.empty else 0.0) if not missing_price_symbols else None
+    total_pnl = realized_pnl + unrealized_pnl if unrealized_pnl is not None else None
     capital_base = realized_cost + open_cost
 
     history_df = pd.DataFrame()
@@ -291,7 +422,7 @@ def calculate_investment_summary(
             realized_pnl=("pnl", "sum"),
             proceeds=("proceeds", "sum"),
             cost=("cost", "sum"),
-            trades=("sell_id", "count"),
+            trades=("sell_id", "nunique"),
         )
         history_df["return_pct"] = history_df["realized_pnl"] / history_df["cost"].replace(0, pd.NA)
         history_df["return_pct"] = history_df["return_pct"].fillna(0.0)
@@ -310,9 +441,10 @@ def calculate_investment_summary(
             "unrealized_pnl": unrealized_pnl,
             "total_pnl": total_pnl,
             "realized_return": realized_pnl / realized_cost if realized_cost else 0.0,
-            "total_return": total_pnl / capital_base if capital_base else 0.0,
+            "total_return": (total_pnl / capital_base if capital_base else 0.0) if total_pnl is not None else None,
             "open_cost": open_cost,
             "market_value": market_value,
             "capital_base": capital_base,
+            "missing_price_symbols": missing_price_symbols,
         },
     }

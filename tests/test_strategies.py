@@ -98,3 +98,32 @@ class TestBollingerBandsStrategy:
         strat = BollingerBandsStrategy(window=20, num_std=2.0)
         result = strat.generate_signals(df)
         assert result['position'].sum() == 0, "数据不足时不应有仓位"
+
+
+def test_reversal_respects_minimum_position_at_start_and_after_sell():
+    df = _make_df([100.0] * 8 + [80.0, 100.0, 120.0, 100.0])
+    strategy = BollingerBandsStrategy(window=5, num_std=1, staged=False,
+                                      confirm_reversal=True, min_position=0.2)
+    result = strategy.generate_signals(df)
+    assert result['position'].iloc[0] == pytest.approx(0.2)
+    assert result['signal'].iloc[0] == pytest.approx(0.2)
+    assert result['position'].iloc[9] == pytest.approx(1.0)
+    assert result['position'].iloc[11] == pytest.approx(0.2)
+    assert result['signal'].notna().all()
+
+
+@pytest.mark.parametrize('kwargs', [
+    {},
+    {'staged': False},
+    {'staged': False, 'confirm_reversal': True},
+    {'pyramid_levels': [0.01, 0.03], 'pyramid_sizes': [0.4, 0.6]},
+])
+def test_bollinger_signals_do_not_change_when_future_prices_are_added(kwargs):
+    rng = np.random.default_rng(12)
+    df = _make_df((100 * np.exp(rng.normal(0, 0.035, 150).cumsum())).tolist())
+    original = df.copy(deep=True)
+    strategy = BollingerBandsStrategy(window=10, num_std=1.5, **kwargs)
+    prefix = strategy.generate_signals(df.iloc[:100])
+    full = strategy.generate_signals(df)
+    pd.testing.assert_frame_equal(prefix, full.iloc[:100])
+    pd.testing.assert_frame_equal(df, original)

@@ -3,6 +3,7 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from src.monitoring import summarize_monitor_status
 
 
 RANGE_OPTIONS = {
@@ -61,36 +62,13 @@ def _add_monitor_annotations(fig, status, row=1, col=1):
             x=[date],
             y=[close],
             mode="markers",
-            name="当前价",
+            name="日线收盘",
             marker=dict(size=9, color=color, line=dict(width=2, color="#ffffff")),
-            hovertemplate="当前价 %{y:.3f}<extra></extra>",
+            hovertemplate="日线收盘 %{y:.3f}<extra></extra>",
             showlegend=False,
         ),
         row=row,
         col=col,
-    )
-
-    fig.add_annotation(
-        xref="paper",
-        yref="paper",
-        x=0.012,
-        y=1.17,
-        xanchor="left",
-        yanchor="top",
-        align="left",
-        showarrow=False,
-        bgcolor=bg,
-        bordercolor=color,
-        borderwidth=1,
-        borderpad=8,
-        font=dict(size=12, color="#111827"),
-        text=(
-            f"<b>{status['symbol']} {status['name']} · {label}</b><br>"
-            f"现价 <b>{close:.3f}</b> ｜ 目标仓位 <b>{status['target_position']:.0%}</b> ｜ "
-            f"通道位置 <b>{status['channel_position']:.0%}</b><br>"
-            f"下轨 {lower:.3f}（距 {status['dist_to_lower']:.2%}） ｜ "
-            f"上轨 {upper:.3f}（距 {status['dist_to_upper']:.2%}）"
-        ),
     )
 
     fig.add_annotation(
@@ -110,13 +88,13 @@ def _add_monitor_annotations(fig, status, row=1, col=1):
         borderwidth=1,
         borderpad=4,
         font=dict(size=11, color="#111827"),
-        text=f"现价 {close:.3f}",
+        text=f"收盘 {close:.3f}",
         row=row,
         col=col,
     )
 
 
-def render(ctx, title="K线与布林带", compact=False):
+def render(ctx, title="K线与布林带", compact=False, symbol=None):
     """Render K-line and Bollinger bands for the selected ETF."""
     frames = ctx['frames']
     profiles = ctx['profiles']
@@ -124,35 +102,45 @@ def render(ctx, title="K线与布林带", compact=False):
     if title:
         st.markdown(f"### {title}")
 
-    control_cols = st.columns([1.1, 2.4, 1.5])
-    with control_cols[0]:
-        etf_choice = st.radio("选择 ETF", ["510880", "512890"], horizontal=True)
+    etf_choice = symbol or st.radio("选择 ETF", ["510880", "512890"], horizontal=True, key="chart_etf")
+    control_cols = st.columns([4, 1], vertical_alignment="bottom")
     df_kline = frames[etf_choice].copy()
     profile = profiles[etf_choice]
     status = ctx["statuses"].get(etf_choice, {})
     param_idx = 1 if etf_choice == "510880" else 2
+    if df_kline.empty:
+        st.info(f"{profile.name} 暂无可用行情，请调整数据区间或刷新。")
+        return
 
-    with control_cols[1]:
+    with control_cols[0]:
         range_choice = st.segmented_control(
             "显示区间",
             options=list(RANGE_OPTIONS.keys()),
-            default="近3月",
+            default=None if f"kline_range_{etf_choice}" in st.session_state else "近3月",
             key=f"kline_range_{etf_choice}",
-        )
-    with control_cols[2]:
-        show_volume = st.toggle("显示成交量", value=True, key=f"kline_volume_{etf_choice}")
+        ) or "近3月"
+    with control_cols[1]:
+        with st.popover("图表设置"):
+            chart_type = st.radio("图表类型", ["K线", "收盘线"], key="kline_type")
+            has_volume = "volume" in df_kline.columns and df_kline["volume"].notna().any()
+            show_volume = st.toggle("显示成交量", value=False if f"kline_volume_{etf_choice}" in st.session_state else bool(has_volume), disabled=not has_volume,
+                                    key=f"kline_volume_{etf_choice}") and has_volume
 
     if range_choice == "自定义":
         min_date = df_kline.index.min().date()
         max_date = df_kline.index.max().date()
         default_start = _slice_recent_rows(df_kline, 66).index.min().date()
+        saved_range_key = f"kline_custom_range_{etf_choice}"
+        saved_range = st.session_state.get(saved_range_key, (default_start, max_date))
+        saved_range = tuple(min(max(day, min_date), max_date) for day in saved_range)
         selected_range = st.date_input(
             "自定义日期范围",
-            value=(default_start, max_date),
+            value=saved_range,
             min_value=min_date,
             max_value=max_date,
-            key=f"kline_custom_range_{etf_choice}",
+            key=f"_kline_custom_range_{etf_choice}",
         )
+        st.session_state[saved_range_key] = selected_range
         if isinstance(selected_range, tuple) and len(selected_range) == 2:
             start_date, end_date = selected_range
             df_view = df_kline.loc[pd.Timestamp(start_date):pd.Timestamp(end_date)].copy()
@@ -167,12 +155,20 @@ def render(ctx, title="K线与布林带", compact=False):
 
     first_view_date = df_view.index.min()
     last_view_date = df_view.index.max()
+    # Historical ranges must annotate their own final day, never an off-screen latest quote.
+    if status.get("date") != last_view_date:
+        status = summarize_monitor_status(
+            df_kline.loc[:last_view_date], symbol=etf_choice, name=profile.name,
+            role=profile.role, window=ctx[f"w{param_idx}"], num_std=ctx[f"std{param_idx}"],
+            first_batch_pct=ctx[f"batch{param_idx}"],
+        )
 
     st.caption(
-        f"{profile.name} | 布林带参数: Window={ctx[f'w{param_idx}']}, "
-        f"Std={ctx[f'std{param_idx}']} | "
+        f"{ctx.get('price_basis', '前复权')} · {ctx[f'w{param_idx}']} 日 / {ctx[f'std{param_idx}']} 倍标准差 · "
         f"当前显示 {_format_date(first_view_date)} 至 {_format_date(last_view_date)}，共 {len(df_view)} 个交易日"
     )
+    if show_volume and ctx.get("provider") == "hithink":
+        st.caption("成交量保留接口原始单位；官方 ETF 文档未注明份/手，未作单位换算。")
 
     fig_kline = make_subplots(
         rows=2 if show_volume else 1, cols=1,
@@ -181,31 +177,33 @@ def render(ctx, title="K线与布林带", compact=False):
         row_heights=[0.72, 0.28] if show_volume else None
     )
 
-    # 蜡烛图
-    fig_kline.add_trace(go.Candlestick(
-        x=df_view.index,
-        open=df_view['open'],
-        high=df_view['high'],
-        low=df_view['low'],
-        close=df_view['close'],
-        name="K线",
-        increasing_line_color='#ef4444',
-        decreasing_line_color='#22c55e'
-    ), row=1, col=1)
+    if chart_type == "K线":
+        fig_kline.add_trace(go.Candlestick(
+            x=df_view.index, open=df_view['open'], high=df_view['high'],
+            low=df_view['low'], close=df_view['close'], name="K线",
+            increasing_line_color='#be3e47', decreasing_line_color='#188568',
+            increasing_fillcolor='#be3e47', decreasing_fillcolor='#188568',
+        ), row=1, col=1)
+    else:
+        fig_kline.add_trace(go.Scatter(
+            x=df_view.index, y=df_view['close'], name="收盘价",
+            line=dict(color='#202938', width=2),
+            hovertemplate="收盘 %{y:.3f}<extra></extra>",
+        ), row=1, col=1)
 
     # 布林带
     fig_kline.add_trace(go.Scatter(
         x=df_view.index, y=df_view['upper_band'],
-        name="上轨", line=dict(color='#f59e0b', width=1, dash='dash')
-    ), row=1, col=1)
-    fig_kline.add_trace(go.Scatter(
-        x=df_view.index, y=df_view['ma'],
-        name="中轨", line=dict(color='#f59e0b', width=1)
+        name="上轨", line=dict(color='#6b8bc5', width=1, dash='dash')
     ), row=1, col=1)
     fig_kline.add_trace(go.Scatter(
         x=df_view.index, y=df_view['lower_band'],
-        name="下轨", line=dict(color='#f59e0b', width=1, dash='dash'),
-        fill='tonexty', fillcolor='rgba(251, 191, 36, 0.1)'
+        name="下轨", line=dict(color='#6b8bc5', width=1, dash='dash'),
+        fill='tonexty', fillcolor='rgba(75, 113, 182, 0.055)'
+    ), row=1, col=1)
+    fig_kline.add_trace(go.Scatter(
+        x=df_view.index, y=df_view['ma'],
+        name="中轨", line=dict(color='#6b8bc5', width=1)
     ), row=1, col=1)
 
     # 买卖信号标记
@@ -216,17 +214,17 @@ def render(ctx, title="K线与布林带", compact=False):
         x=buys.index, y=buys['low'] * 0.99,
         mode='markers',
         name='买入',
-        marker=dict(symbol='triangle-up', size=12, color='#ef4444')
+        marker=dict(symbol='triangle-up', size=12, color='#be3e47')
     ), row=1, col=1)
     fig_kline.add_trace(go.Scatter(
         x=sells.index, y=sells['high'] * 1.01,
         mode='markers',
         name='卖出',
-        marker=dict(symbol='triangle-down', size=12, color='#22c55e')
+        marker=dict(symbol='triangle-down', size=12, color='#188568')
     ), row=1, col=1)
 
     if show_volume:
-        colors = ['#ef4444' if df_view['close'].iloc[i] >= df_view['open'].iloc[i] else '#22c55e'
+        colors = ['#be3e47' if df_view['close'].iloc[i] >= df_view['open'].iloc[i] else '#188568'
                   for i in range(len(df_view))]
         fig_kline.add_trace(go.Bar(
             x=df_view.index, y=df_view['volume'],
@@ -239,16 +237,19 @@ def render(ctx, title="K线与布林带", compact=False):
         template='plotly_white',
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
-        height=500 if compact else 660,
+        height=440 if compact else 560,
+        font=dict(family="Arial, sans-serif", color="#667085", size=11),
+        uirevision=f"{etf_choice}:{range_choice}:{first_view_date}:{last_view_date}",
         xaxis_rangeslider_visible=False,
         dragmode="pan",
         hovermode="x unified",
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(l=20, r=20, t=106, b=20),
+        margin=dict(l=0, r=50, t=34, b=15),
     )
     fig_kline.update_xaxes(
         gridcolor='#f3f4f6',
+        tickformat='%m/%d', hoverformat='%Y-%m-%d',
         rangebreaks=[dict(bounds=["sat", "mon"])],
         showspikes=True,
         spikemode="across",
@@ -256,14 +257,12 @@ def render(ctx, title="K线与布林带", compact=False):
         spikethickness=1,
         spikecolor="#9ca3af",
     )
-    fig_kline.update_yaxes(gridcolor='#f3f4f6', fixedrange=False)
+    fig_kline.update_yaxes(gridcolor='#eff2f6', fixedrange=False, side='right')
+    fig_kline.update_yaxes(tickformat='.3f', row=1, col=1)
 
     st.plotly_chart(
-        fig_kline,
-        width="stretch",
-        config={
-            "scrollZoom": False,
-            "displaylogo": False,
-            "modeBarButtonsToRemove": ["select2d", "lasso2d", "zoom2d"],
-        },
+        fig_kline, width="stretch", key=f"kline_chart_{etf_choice}",
+        config={"scrollZoom": False, "displaylogo": False,
+                "modeBarButtonsToRemove": ["select2d", "lasso2d", "zoom2d"]},
     )
+    return {"status": status, "last_date": last_view_date, "first_date": first_view_date}

@@ -16,7 +16,7 @@ def render(ctx):
     )
 
     st.markdown("---")
-    if tool == "信号流水":
+    if tool != "参数优化":
         tab_signals.render(ctx)
     else:
         tab_optimize.render(ctx)

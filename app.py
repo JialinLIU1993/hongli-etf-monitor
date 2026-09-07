@@ -1,126 +1,42 @@
-"""红利双雄 ETF 盯盘看板."""
+"""Application shell: controls → shared data context → focused workspace."""
 import logging
-
-import pandas as pd
 import streamlit as st
-
-from components import tab_dashboard, tab_strategy_tools
-from components.sidebar import render_sidebar
+from components import tab_dashboard, tab_investments, tab_signals, tab_optimize
+from components.workspace_controls import render_controls
+from components.workspace_context import build_context
 from components.styles import CUSTOM_CSS
-from src.data_loader import fetch_etf_data
-from src.monitoring import (
-    ETF_PROFILES,
-    calculate_monitor_frame,
-    summarize_data_status,
-    summarize_monitor_status,
-)
-
+from src.data_sources import PROVIDER_LABELS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
-
-
-st.set_page_config(
-    page_title="红利双雄 ETF 盯盘",
-    page_icon="📡",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="红利双雄 · 投资工作台", page_icon="◈", layout="wide", initial_sidebar_state="collapsed")
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+cfg = render_controls()
 
-st.markdown(
-    """
-    <div style="padding: 0.75rem 0 1rem 0;">
-        <h1 style="font-size: 2.35rem; margin-bottom: 0.35rem;">红利双雄 ETF 盯盘</h1>
-        <p style="color: #4b5563; font-size: 1.05rem; margin: 0;">
-            510880 红利 ETF + 512890 红利低波 | AkShare 日线 | 布林带触发价与目标仓位
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+# Keep view preferences when navigating to a workspace without those widgets.
+for state_key in list(st.session_state):
+    if state_key.startswith(("kline_", "opt_", "signal_filter_")) or state_key == "chart_etf":
+        st.session_state[state_key] = st.session_state[state_key]
+with st.spinner("正在准备行情…"):
+    ctx, warnings = build_context(cfg)
+for warning in warnings:
+    st.warning(warning)
 
-cfg = render_sidebar()
-
-
-@st.cache_data(show_spinner=False)
-def load_data(symbol, start, end, force=False):
-    """Load ETF data using the original AkShare-backed data source."""
-    start_str = start.strftime("%Y%m%d") if hasattr(start, "strftime") else start
-    end_str = end.strftime("%Y%m%d") if hasattr(end, "strftime") else end
-    return fetch_etf_data(symbol, start_date=start_str, end_date=end_str, force_update=force)
-
-
-with st.spinner("正在加载两只 ETF 的盯盘数据..."):
-    raw_data = {
-        symbol: load_data(symbol, cfg["start_date"], cfg["end_date"], cfg["force_update"])
-        for symbol in ["510880", "512890"]
-    }
-
-if any(df.empty for df in raw_data.values()):
-    st.error("数据加载失败，请检查网络连接或本地缓存后重试。")
-    st.stop()
-
-frames = {}
-statuses = {}
-data_status = {}
-
-for idx, symbol in enumerate(["510880", "512890"], start=1):
-    profile = ETF_PROFILES[symbol]
-    window = cfg[f"w{idx}"]
-    num_std = cfg[f"std{idx}"]
-    first_batch_pct = cfg[f"batch{idx}"]
-    frame = calculate_monitor_frame(
-        raw_data[symbol],
-        window=window,
-        num_std=num_std,
-        first_batch_pct=first_batch_pct,
-        scale_threshold=cfg["scale_threshold"],
-        pyramid_levels=cfg["pyramid_levels"],
-        pyramid_sizes=cfg["pyramid_sizes"],
-    )
-    frames[symbol] = frame
-    data_status[symbol] = summarize_data_status(raw_data[symbol], symbol)
-    statuses[symbol] = summarize_monitor_status(
-        frame,
-        symbol=symbol,
-        name=profile.name,
-        role=profile.role,
-        window=window,
-        num_std=num_std,
-        first_batch_pct=first_batch_pct,
-    )
-
-
-ctx = {
-    "profiles": ETF_PROFILES,
-    "raw_data": raw_data,
-    "frames": frames,
-    "statuses": statuses,
-    "data_status": data_status,
-    "start_date": cfg["start_date"],
-    "end_date": cfg["end_date"],
-    "w1": cfg["w1"],
-    "std1": cfg["std1"],
-    "batch1": cfg["batch1"],
-    "w2": cfg["w2"],
-    "std2": cfg["std2"],
-    "batch2": cfg["batch2"],
-    "scale_threshold": cfg["scale_threshold"],
-}
-
-tab1, tab2 = st.tabs(["Dashboard", "策略工具"])
-
-with tab1:
+page = cfg["page"]
+if page == "行情总览":
     tab_dashboard.render(ctx)
-with tab2:
-    tab_strategy_tools.render(ctx)
-
-st.markdown("---")
-st.markdown(
-    """
-    <div style="text-align: center; color: #6b7280; font-size: 0.85rem;">
-        红利双雄 ETF 盯盘 | 数据来源: AkShare | 布林带信号仅供参考，投资需谨慎
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+else:
+    descriptions = {
+        "持仓记录": ("我的持仓", "从成交记录查看资产与收益"),
+        "信号复盘": ("调仓复盘", "还原信号发生时的价格与仓位"),
+        "参数研究": ("策略实验", "在历史行情中比较参数表现"),
+    }
+    title, description = descriptions[page]
+    st.markdown(f'<div class="workspace-title"><h1>{title}</h1><p>{description}</p></div>', unsafe_allow_html=True)
+    if page == "持仓记录":
+        tab_investments.render(ctx, show_title=False, compact=True)
+    elif page == "信号复盘":
+        tab_signals.render(ctx)
+    else:
+        tab_optimize.render(ctx)
+st.caption(f"行情来源：{PROVIDER_LABELS[ctx['provider']]} · {ctx['price_basis']} · 数据范围 {ctx['start_date']:%Y.%m.%d} — {ctx['end_date']:%Y.%m.%d}")
+st.markdown('<footer class="workspace-footer"><span>红利双雄 / 投资工作台</span><span>策略目标不等于实际持仓 · 信号仅供参考</span></footer>', unsafe_allow_html=True)
